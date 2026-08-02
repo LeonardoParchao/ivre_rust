@@ -1,0 +1,583 @@
+#! /usr/bin/env python
+
+# This file is part of IVRE.
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
+#
+# IVRE is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IVRE is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
+"""This sub-module handles configuration values.
+
+It contains the (hard-coded) default values, which can be overwritten
+by ~/.ivre.conf, /usr/local/etc/ivre/ivre.conf,
+/usr/local/etc/ivre.conf, /etc/ivre/ivre.conf and/or
+/etc/ivre.conf.
+
+"""
+
+# The comment lines "Begin XXX" and "End XXX" are used to include
+# parts of this files in the documentation.
+
+import os
+import stat
+from collections.abc import Generator
+
+# Default values:
+DEBUG = False
+DEBUG_DB = False
+DB = "mongodb:///ivre"
+DB_DATA = None  # specific: maxmind:///<ivre_share_path>/geoip
+# DB URL for the ``notes`` purpose (per-entity markdown
+# annotations).  Falls back to ``DB`` when unset.  The ``notes``
+# purpose is independent of every data purpose: ``view --init``,
+# ``nmap --init`` etc. do not touch notes.
+DB_NOTES = None
+# DB URL for the ``audit`` purpose (append-only audit log of
+# uploads, admin actions, and oversized queries).  Falls back to
+# ``DB`` when unset.  The ``audit`` purpose is independent of
+# every other purpose; ``view --init``, ``nmap --init`` etc. do
+# not touch audit events.  Retention is operator-driven (no TTL
+# by default); a dedicated CLI verb purges entries older than a
+# cutoff.  The web / CLI / MCP surfaces consuming this purpose
+# land in follow-up PRs; the storage layer ships first so the
+# ABC contract is reviewable in isolation.
+DB_AUDIT = None
+# Begin batch sizes
+LOCAL_BATCH_SIZE = 10000  # used with --local-bulk
+MONGODB_BATCH_SIZE = 100
+POSTGRES_BATCH_SIZE = 10000
+# End batch sizes
+# Default per-query time limit (in milliseconds) applied to MongoDB
+# operations. Caps the cost of any single query (in particular,
+# user-supplied regular expressions reaching `$regex`). Set to None
+# to disable. May be overridden per-connection with the `maxtime` URL
+# parameter on the `DB` setting.
+MONGODB_QUERY_TIMEOUT_MS: int | None = 30000
+# specific: if no value is specified for *_PATH variables, they are
+# going to be constructed by guessing the installation PREFIX (see the
+# end of this file).
+DATA_PATH = None
+GEOIP_PATH = None
+RIR_PATH = None
+HONEYD_IVRE_SCRIPTS_PATH = None
+WEB_STATIC_PATH = None
+WEB_DOKU_PATH = None
+# specific: if no value is specified, tries /usr/local/share/nmap,
+# /opt/nmap/share/nmap, then /usr/share/nmap.
+NMAP_SHARE_PATH = None
+# Begin commands
+TESSERACT_CMD = "tesseract"
+OPENSSL_CMD = "openssl"
+# End commands
+
+# Begin Masscan probes
+
+# Based on IVRE's fork source code --- you may want to adapt these
+# settings if you use another version of Masscan.
+MASSCAN_PROBES = {
+    "tcp": {
+        53: "DNSVersionBindReqTCP",
+        88: "Kerberos",
+        104: "dicom",
+        111: "RPCCheck",
+        130: "NotesRPC",
+        135: "DNSVersionBindReqTCP",
+        256: "LDAPSearchReq",
+        257: "LDAPSearchReq",
+        389: "LDAPSearchReq",
+        390: "LDAPSearchReq",
+        406: "SIPOptions",
+        427: "NotesRPC",
+        548: "afp",
+        554: "RTSPRequest",
+        1098: "JavaRMI",
+        1099: "JavaRMI",
+        1352: "NotesRPC",
+        1433: "ms-sql-s",
+        1702: "LDAPSearchReq",
+        1972: "NotesRPC",
+        2049: "RPCCheck",
+        2345: "dicom",
+        2375: "docker",
+        2379: "docker",
+        2380: "docker",
+        2761: "dicom",
+        2762: "dicom",
+        3268: "LDAPSearchReq",
+        3892: "LDAPSearchReq",
+        4242: "dicom",
+        5060: "SIPOptions",
+        6000: "X11Probe",
+        6001: "X11Probe",
+        6002: "X11Probe",
+        6003: "X11Probe",
+        6004: "X11Probe",
+        6005: "X11Probe",
+        6006: "X11Probe",
+        6007: "X11Probe",
+        6008: "X11Probe",
+        6009: "X11Probe",
+        6010: "X11Probe",
+        6011: "X11Probe",
+        6012: "X11Probe",
+        6013: "X11Probe",
+        6014: "X11Probe",
+        6015: "X11Probe",
+        6016: "X11Probe",
+        6017: "X11Probe",
+        6018: "X11Probe",
+        6019: "X11Probe",
+        6379: "redis-server",
+        7171: "NotesRPC",
+        8081: "SIPOptions",
+        8554: "RTSPRequest",
+        8728: "NotesRPC",
+        9001: "mongodb",
+        11112: "dicom",
+        11711: "LDAPSearchReq",
+        22001: "NotesRPC",
+        27017: "mongodb",
+        31337: "SIPOptions",
+        49153: "mongodb",
+        50000: "DNSVersionBindReqTCP",
+        50001: "DNSVersionBindReqTCP",
+        50002: "DNSVersionBindReqTCP",
+    },
+}
+# End Masscan probes
+
+# Begin DNSBL
+# Domains used for DNS blacklists (RFC 5782)
+DNS_BLACKLIST_DOMAINS = set(
+    [
+        "blacklist.woody.ch",
+        "zen.spamhaus.org",
+    ]
+)
+# End DNSBL
+
+# Begin flows
+# Dictionary that helps determine server ports of communications. Each entry
+# is {proto: {port: proba}}. The when two ports are known, the port with the
+# highest probability is used.
+# When /usr/share/nmap/nmap-services is available, these probas are taken,
+# otherwise /etc/services is used with proba=0.5 for each entry.
+# KNOWN_PORTS entries have the highest priority.
+# Example:
+#  KNOWN_PORTS = {
+#      "udp": {
+#          9999: 1.0,
+#          12345: 0.5,
+#      },
+#      "tcp": {
+#          20202: 0.8,
+#      },
+#  }
+KNOWN_PORTS: dict[str, dict[int, float]] = {}
+# Enable the recording of appearance times for flows. Will slow down a
+# bit the insertion rate
+FLOW_TIME = True
+# Precision (in seconds) to use when recording times when flows appear
+FLOW_TIME_PRECISION = 3600
+# When recording flow times, record the whole range from start_time to end_time
+# This option is experimental and possibly useless in practice
+FLOW_TIME_FULL_RANGE = True
+# When recording flow times, represents the beginning of the first timeslot
+# as a Unix timestamp shifted to local time.
+# 0 means that the first timeslot starts at 1970-01-01 00:00 (Local time).
+FLOW_TIME_BASE = 0
+# Store high level protocols metadata in flows. It may take much more space.
+FLOW_STORE_METADATA = True
+# End flows
+
+# Begin IPDATA_URLS
+IPDATA_URLS = {
+    # None has a special meaning:
+    # https://download.maxmind.com/app/geoip_download?edition_id=XXX&suffix=XXX&license_key=XXX
+    #
+    # You can use this value for the GeoLite2-* files (and set
+    # MAXMIND_LICENSE_KEY below) to download files from MaxMind
+    # instead of ivre.rocks directly. Maxmind license keys are free
+    # and can be obtained from <https://www.maxmind.com/>
+    "GeoLite2-City.tar.gz": "https://ivre.rocks/data/geolite/GeoLite2-City.tar.gz",
+    "GeoLite2-City-CSV.zip": "https://ivre.rocks/data/geolite/GeoLite2-City-CSV.zip",
+    "GeoLite2-Country.tar.gz": "https://ivre.rocks/data/geolite/GeoLite2-Country.tar.gz",
+    "GeoLite2-Country-CSV.zip": "https://ivre.rocks/data/geolite/GeoLite2-Country-CSV.zip",
+    "GeoLite2-ASN.tar.gz": "https://ivre.rocks/data/geolite/GeoLite2-ASN.tar.gz",
+    "GeoLite2-ASN-CSV.zip": "https://ivre.rocks/data/geolite/GeoLite2-ASN-CSV.zip",
+    # For other files, None has a special meaning "do not
+    # download". The following file can be computed based the
+    # GeoLite2-* files using `ivre ipdata --import-all`. You should do
+    # that if you get your files from Maxmind.
+    "GeoLite2-dumps.tar.gz": "https://ivre.rocks/data/geolite/GeoLite2-dumps.tar.gz",
+    # This one is not from maxmind -- see https://thyme.apnic.net/
+    "BGP.raw": "https://thyme.apnic.net/current/data-raw-table",
+}
+MAXMIND_LICENSE_KEY = None
+# End IPDATA_URLS
+
+GEOIP_LANG = "en"
+
+# Some IP ranges send syn-ack answers for any
+# port. VIEW_SYNACK_HONEYPOT_COUNT is the number of open ports with
+# only syn-ack (no script, no service identified). The value you need
+# to set here highly depends on the number of ports you usually scan
+# and/or see.
+#
+# The default value, 200 seems high enough to work fine with most
+# situations. None means that no host should be treated as a "syn-ack
+# honeypot".
+VIEW_SYNACK_HONEYPOT_COUNT = 200
+# Some hostnames (often at CDNs) have too many hostnames and it might
+# not be very useful to count them all
+VIEW_MAX_HOSTNAMES_COUNT = 200
+
+WEB_ALLOWED_REFERERS = None
+WEB_NOTES_BASE = "/dokuwiki/#IP#"
+# Web modules (data sections) to expose. ``None`` (default)
+# exposes every module whose underlying ``DB_<purpose>`` backend
+# is configured; a list (e.g. ``["view", "active", "rir"]``)
+# narrows the set further \u2014 the effective set is the
+# intersection of ``WEB_MODULES`` and the backends configured.
+# Disabled modules' routes return 404 and the React UI omits
+# their nav entries. Module names: ``"view"``, ``"active"``,
+# ``"passive"``, ``"dns"``, ``"rir"``, ``"flow"``. ``"dns"``
+# requires either ``db.nmap`` or ``db.passive``; the others
+# require their like-named backend.
+WEB_MODULES: list[str] | None = None
+# Hard cap on the number of results any web query may return. When
+# set, it bounds *every* request, including the ``limit:0`` ("no
+# limit") escape hatch -- it cannot be bypassed via ``q=limit:0``.
+# ``None`` (default) means no cap (``limit:0`` then truly returns
+# everything).
+WEB_MAXRESULTS = None
+WEB_WARN_DOTS_COUNT = 20000
+WEB_GET_NOTEPAD_PAGES = None
+WEB_LIMIT = 10
+WEB_GRAPH_LIMIT = 1000
+# When ``True`` (the default), the React Web UI staggers the
+# per-page requests so the backend never has to answer the
+# results, the map and every facet at the same time. The order
+# is: results first, then the map (only on the View section —
+# the other sections have no separate map request), then each
+# facet in declared order. The timeline widget is not a stage:
+# it is rendered client-side from the already-fetched results
+# array and so appears as soon as the results query settles,
+# before the first facet fires. Set to ``False`` to restore the
+# legacy "fire everything on mount" behaviour, e.g. on
+# deployments where the extra request latency outweighs the
+# server-load benefit.
+#
+# Scope: the staggering targets the *first load* of each page
+# and any query-change cycle (typing in the filter bar). It does
+# *not* re-serialise background refetches, because none of the
+# orchestrated React Query keys currently have refetch triggers
+# (``refetchOnWindowFocus`` is off, no polling, no manual
+# invalidation on these keys). If you add such triggers and
+# observe backend stress, that is the time to extend the gates
+# client-side — this server-side knob does not need to change.
+#
+# Consumed client-side only; the value is emitted by
+# ``/cgi/config`` and read by the React UI's
+# ``isSequentialLoading`` helper.
+WEB_SEQUENTIAL_LOADING = True
+# Maximum length, in characters, of a user-supplied regex literal
+# (the inner pattern of a ``/.../[flags]`` value reaching
+# ``ivre.web.utils.str2regexp``). Enforced before the pattern is
+# parsed, as defence-in-depth on top of the server-side
+# ``MONGODB_QUERY_TIMEOUT_MS`` cap and the regexploit-based
+# ReDoS analyser. Set to ``None`` to disable the length check.
+WEB_REGEX_MAX_LENGTH: int | None = 1000
+# Maximum allowed regexploit "starriness" — the depth of nested
+# unbounded repetition that an attacker can drive through
+# backtracking. ``2`` matches the regexploit CLI default
+# (``starriness > 2`` is reported); the canonical exponential
+# ReDoS shapes (``(a+)+x``, ``(.*)*x``, ``(a|a)*x``, ...) all
+# come in at ``starriness >= 11`` so a limit of ``2`` rejects
+# them while accepting realistic operator-typed regex. Set to
+# ``None`` to disable the ReDoS check.
+WEB_REGEX_STARRINESS_LIMIT: int | None = 2
+# access control disabled by default:
+WEB_INIT_QUERIES: dict[str, str] = {}
+# Warning: None means no access control, and is equivalent to "full"
+WEB_DEFAULT_INIT_QUERY = None
+# upload disabled by default
+WEB_UPLOAD_OK = False
+# Hard ceiling on ``/iprange?output=addrs`` responses. Bounds the
+# size of an enumerated address list the server is willing to
+# serialise into a single JSON response (a /0 selector with
+# ``output=addrs`` would otherwise stream billions of strings).
+# The ``count`` / ``cidrs`` / ``ranges`` outputs are naturally
+# bounded by the underlying ``IPRanges`` shape and are not
+# capped. Set to ``None`` to disable the cap.
+WEB_IPRANGE_ADDR_CAP: int | None = 100_000
+# Maximum size, in bytes, accepted for a single note body
+# (per-entity markdown annotation stored in the ``notes``
+# purpose).  The storage layer enforces this via
+# :meth:`DBNotes._validate_note_body_size` as defence-in-depth;
+# web routes return HTTP 413 for over-cap requests before they
+# reach the DB.  Set to ``None`` to disable the cap (Mongo's
+# BSON 16 MiB document limit still applies).
+WEB_HOST_NOTES_MAX_BYTES: int | None = 1_000_000
+# Feed with a random value, like `openssl rand -base64 42`.
+# *Mandatory* when WEB_AUTH_ENABLED == True
+WEB_SECRET = None
+
+# --- Authentication ---
+# Set to True to enable built-in authentication
+WEB_AUTH_ENABLED = False
+# OAuth providers (set client_id + client_secret to enable each)
+WEB_AUTH_GOOGLE_CLIENT_ID = None
+WEB_AUTH_GOOGLE_CLIENT_SECRET = None
+WEB_AUTH_MICROSOFT_CLIENT_ID = None
+WEB_AUTH_MICROSOFT_CLIENT_SECRET = None
+WEB_AUTH_MICROSOFT_TENANT = "common"
+WEB_AUTH_GITHUB_CLIENT_ID = None
+WEB_AUTH_GITHUB_CLIENT_SECRET = None
+# Magic link email
+WEB_AUTH_MAGIC_LINK_ENABLED = False
+WEB_AUTH_SMTP_HOST = "localhost"
+WEB_AUTH_SMTP_PORT = 587
+WEB_AUTH_SMTP_USER = None
+WEB_AUTH_SMTP_PASSWORD = None
+WEB_AUTH_SMTP_FROM = "noreply@example.com"
+WEB_AUTH_SMTP_USE_TLS = True
+# Registration policy:
+#   "open" = anyone can register
+#   "domain:example.com,corp.net" = only these email domains
+#   "closed" = admin must create accounts
+WEB_AUTH_REGISTRATION = "closed"
+# Session lifetime in seconds
+WEB_AUTH_SESSION_LIFETIME = 86400 * 7  # 7 days
+# Magic link lifetime in seconds
+WEB_AUTH_MAGIC_LINK_LIFETIME = 900  # 15 minutes
+# Magic link rate limits (per 15-minute window)
+WEB_AUTH_MAGIC_LINK_RATE_PER_EMAIL = 3
+WEB_AUTH_MAGIC_LINK_RATE_PER_IP = 10
+# Per-API-key quota on the data-plane routes (``/scans``,
+# ``/view``, ``/passive``, ``/flows``, ``/ipdata``,
+# ``/passivedns``, ``/dns``, ``/rir``, ``/iprange``). A request
+# authenticated by an ``X-API-Key`` or ``Authorization: Bearer
+# ...`` header is gated through a sliding window of
+# ``WEB_API_KEY_RATE_MAX`` requests per
+# ``WEB_API_KEY_RATE_WINDOW`` seconds, per key. Over-quota
+# requests get ``HTTP 429``; only the *allowed* requests are
+# counted (an over-quota request does not extend the window,
+# matching the magic-link rate-limit pattern). Set
+# ``WEB_API_KEY_RATE_MAX`` to a positive integer to enable;
+# ``None`` (the default) disables the gate. Session-cookie /
+# REMOTE_USER traffic is unaffected -- this knob targets
+# programmatic clients authenticated with an API key.
+#
+# Both knobs are validated at WSGI worker startup (see
+# ``ivre.web.base._validate_quota_config``):
+# ``WEB_API_KEY_RATE_MAX`` must be ``None`` or a positive
+# ``int`` (``bool`` is explicitly rejected so ``True`` does not
+# silently enable a 1-request quota), and
+# ``WEB_API_KEY_RATE_WINDOW`` must be a positive ``int`` when
+# the gate is enabled. A malformed value raises ``ValueError``
+# during ``ivre httpd`` startup rather than degrading silently
+# at request time.
+WEB_API_KEY_RATE_MAX: int | None = None
+WEB_API_KEY_RATE_WINDOW = 60
+# Base URL for OAuth callbacks (auto-detected from request if None)
+WEB_AUTH_BASE_URL = None
+# Generic OIDC provider
+WEB_AUTH_OIDC_CLIENT_ID = None
+WEB_AUTH_OIDC_CLIENT_SECRET = None
+# OIDC Discovery URL (e.g. "https://idp.example.com/.well-known/openid-configuration")
+# When set, authorize/token/userinfo URLs are auto-discovered.
+WEB_AUTH_OIDC_DISCOVERY_URL = None
+# Manual endpoint overrides (used when DISCOVERY_URL is not set)
+WEB_AUTH_OIDC_AUTHORIZE_URL = None
+WEB_AUTH_OIDC_TOKEN_URL = None
+WEB_AUTH_OIDC_USERINFO_URL = None
+WEB_AUTH_OIDC_SCOPES = "openid email profile"
+# Label shown on the login page button
+WEB_AUTH_OIDC_LABEL = "SSO"
+
+
+# --- MCP server ---
+# Bind address / port / path used when `ivre mcp-server --http` starts
+# without explicit CLI flags. Defaults are loopback-only.
+MCP_HTTP_BIND = "127.0.0.1"
+MCP_HTTP_PORT = 9100
+MCP_HTTP_PATH = "/mcp"
+# When True, bypasses API-key authentication on the HTTP transport.
+# The HTTP server refuses to start when this is False (default) and
+# bound to a non-loopback address without a valid auth backend.
+MCP_HTTP_ALLOW_ANONYMOUS = False
+
+# --- MCP server: OAuth 2.1 Authorization Server (consent) ---
+# When True, the MCP HTTP transport additionally mounts the OAuth 2.1
+# Authorization Server endpoints (``/.well-known/oauth-authorization-server``,
+# ``/authorize``, ``/token``, ``/register``, ``/revoke``). MCP clients
+# (Claude Desktop, Cursor, Claude Code, …) will then drive an end-user
+# consent flow against IVRE rather than requiring an out-of-band API
+# key. Requires ``WEB_AUTH_ENABLED = True`` (the consent page reuses
+# the existing IVRE session / login flow). API-key bearer auth keeps
+# working alongside OAuth tokens for backwards compatibility.
+MCP_OAUTH_AS_ENABLED = False
+# When True, MCP clients may self-register via RFC 7591 dynamic client
+# registration (``POST /register``). When False, clients must be
+# admin-provisioned (no built-in CLI for that yet -- write directly to
+# ``db.auth.create_oauth_client``).
+MCP_OAUTH_DCR_ENABLED = True
+# Lifetime of a one-shot authorization request awaiting user consent,
+# in seconds. Short on purpose: it bounds how long an in-flight
+# authorize URL stays valid before the user has to retry from the MCP
+# client.
+MCP_OAUTH_REQUEST_TTL = 600
+# Lifetime of an issued authorization code, in seconds. RFC 6749
+# recommends "very short", typically under ten minutes.
+MCP_OAUTH_CODE_TTL = 600
+# Lifetime of an issued access token, in seconds. Short-lived; clients
+# refresh via the refresh-token flow.
+MCP_OAUTH_ACCESS_TOKEN_TTL = 3600
+# Lifetime of an issued refresh token, in seconds. ``None`` disables
+# the expiry (refresh tokens last until revoked).
+MCP_OAUTH_REFRESH_TOKEN_TTL: int | None = 2_592_000
+# Public-facing base URL the AS advertises in its metadata document
+# and embeds in redirect URLs (``/authorize`` redirects to
+# ``<base_url>/cgi/auth/oauth/consent?...``). When ``None``, IVRE
+# infers the URL from each incoming request (works behind a single
+# reverse proxy); set explicitly when running multiple front-ends or
+# when ``WEB_AUTH_BASE_URL`` is not suitable.
+MCP_OAUTH_PUBLIC_URL: str | None = None
+
+
+def get_config_file(paths: list[str] | None = None) -> Generator[str, None, None]:
+    """Generates (yields) the available config files, in the correct order."""
+    if paths is None:
+        paths = [
+            os.path.join(path, "ivre.conf")
+            for path in ["/etc", "/etc/ivre", "/usr/local/etc", "/usr/local/etc/ivre"]
+        ]
+        paths.append(os.path.join(os.path.expanduser("~"), ".ivre.conf"))
+        if "IVRE_CONF" in os.environ:
+            paths.append(os.environ["IVRE_CONF"])
+    for path in paths:
+        if os.path.isfile(path):
+            yield path
+
+
+for fname in get_config_file():
+    # pylint: disable=exec-used
+    with open(fname, "rb") as fdesc:
+        exec(compile(fdesc.read(), fname, "exec"))
+
+
+def guess_prefix(directory: str) -> str | None:
+    """Attempts to find the base directory where IVRE components are
+    installed.
+
+    """
+
+    # Source tree / editable install: check repo root
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    if directory == "dokuwiki":
+        test = os.path.join(repo_root, "web", directory)
+    else:
+        test = os.path.join(repo_root, directory)
+    try:
+        if stat.S_ISDIR(os.stat(test).st_mode):
+            return test
+    except OSError:
+        pass
+
+    def check_candidate(path: str, directory: str) -> str | None:
+        """Auxiliary function that checks whether a particular path is a good
+        candidate.
+
+        """
+        candidate = os.path.join(path, "share", "ivre", directory)
+        try:
+            if stat.S_ISDIR(os.stat(candidate).st_mode):
+                return candidate
+        except OSError:
+            pass
+        return None
+
+    base_file = os.path.abspath(__file__)
+    path = "/"
+    # absolute path
+    for elt in base_file.split(os.path.sep)[1:]:
+        if elt in {"lib", "lib32", "lib64"}:
+            if (candidate := check_candidate(path, directory=directory)) is not None:
+                return candidate
+        path = os.path.join(path, elt)
+    for path in ["/usr", "/usr/local", "/opt", "/opt/ivre"]:
+        candidate = check_candidate(path, directory=directory)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def guess_share(soft: str) -> str | None:
+    for path in [
+        f"/usr/local/share/{soft}",
+        f"/opt/{soft}/share/{soft}",
+        f"/usr/share/{soft}",
+    ]:
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+if GEOIP_PATH is None:
+    GEOIP_PATH = guess_prefix("geoip")
+
+
+if RIR_PATH is None:
+    RIR_PATH = guess_prefix("rir_data")
+
+
+if DB_DATA is None and GEOIP_PATH is not None:
+    DB_DATA = f"maxmind:///{GEOIP_PATH}"
+
+
+# Per-entity notes default to the same store as everything else
+# (operators get a working ``db.notes`` out of the box).  Override
+# DB_NOTES explicitly to move notes to a separate store.
+if DB_NOTES is None:
+    DB_NOTES = DB
+
+
+# Audit log defaults to the same store as everything else
+# (operators get a working ``db.audit`` out of the box).
+# Override DB_AUDIT explicitly to direct the audit stream to a
+# dedicated store -- typical compliance setups point this at a
+# write-restricted PostgreSQL with WORM-style append controls
+# while keeping the rest of IVRE on Mongo.
+if DB_AUDIT is None:
+    DB_AUDIT = DB
+
+
+if DATA_PATH is None:
+    DATA_PATH = guess_prefix("data")
+
+
+if WEB_STATIC_PATH is None:
+    WEB_STATIC_PATH = guess_prefix(directory="web/static")
+
+
+if WEB_DOKU_PATH is None:
+    WEB_DOKU_PATH = guess_prefix(directory="dokuwiki")
+
+
+if HONEYD_IVRE_SCRIPTS_PATH is None and DATA_PATH is not None:
+    HONEYD_IVRE_SCRIPTS_PATH = os.path.join(DATA_PATH, "honeyd")
+
+
+if NMAP_SHARE_PATH is None:
+    NMAP_SHARE_PATH = guess_share("nmap")
