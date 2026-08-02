@@ -1,0 +1,304 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Docker &mdash; IVRE  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Usage" href="../usage/index.html" />
+    <link rel="prev" title="Fast install &amp; first run" href="fast-install-and-first-run.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            IVRE
+              <img src="../_static/logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview/index.html">Overview</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Installation</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="installation.html">Installation guidelines</a></li>
+<li class="toctree-l2"><a class="reference internal" href="config.html">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fast-install-and-first-run.html">Fast install &amp; first run</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Docker</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#versions">Versions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#images">Images</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#using-docker-compose">Using docker compose</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#using-vagrant">Using Vagrant</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#build-the-images">Build the images</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#alternative-builds-for-the-base-image">Alternative builds for the base image</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#initialization">Initialization</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../usage/index.html">Usage</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../dev/index.html">Development</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Licenses:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../license.html">IVRE: GPL v3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../license-external.html">Licenses for external files</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">IVRE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Installation</a></li>
+      <li class="breadcrumb-item active">Docker</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/install/docker.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="docker">
+<h1>Docker<a class="headerlink" href="#docker" title="Link to this heading"></a></h1>
+<section id="versions">
+<h2>Versions<a class="headerlink" href="#versions" title="Link to this heading"></a></h2>
+<p>The images published on Docker hub are built from the current
+<code class="docutils literal notranslate"><span class="pre">master</span></code> repository branch (tag <code class="docutils literal notranslate"><span class="pre">latest</span></code>, will be used by default)
+and from the current release (tag <code class="docutils literal notranslate"><span class="pre">vX.Y.Z</span></code>, use
+<code class="docutils literal notranslate"><span class="pre">ivre/&lt;imagename&gt;:vX.Y.Z</span></code> to use it).</p>
+</section>
+<section id="images">
+<h2>Images<a class="headerlink" href="#images" title="Link to this heading"></a></h2>
+<p>IVRE ships the following Docker images (all built from the
+<code class="docutils literal notranslate"><span class="pre">Dockerfile</span></code>s under <code class="docutils literal notranslate"><span class="pre">docker/</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Image</p></th>
+<th class="head"><p>Role</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/base</span></code></p></td>
+<td><p>Base image with IVRE and its dependencies installed;
+parent of every other image.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/client</span></code></p></td>
+<td><p>CLI container, used to run <code class="docutils literal notranslate"><span class="pre">ivre</span></code> subcommands
+against the database.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/web</span></code></p></td>
+<td><p>nginx front-end serving the Web UI static assets and
+reverse-proxying <code class="docutils literal notranslate"><span class="pre">/cgi/</span></code>, <code class="docutils literal notranslate"><span class="pre">/dokuwiki/</span></code> and
+<code class="docutils literal notranslate"><span class="pre">/mcp</span></code> to the internal backends.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/web-uwsgi</span></code></p></td>
+<td><p>uWSGI application server running the IVRE Web API
+(Bottle app in <code class="xref py py-mod docutils literal notranslate"><span class="pre">ivre.web.app</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/web-doku</span></code></p></td>
+<td><p>PHP-FPM container running the Dokuwiki wiki
+integrated in the Web UI.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ivre/web-mcp</span></code></p></td>
+<td><p><a class="reference internal" href="../usage/mcp-server.html"><span class="doc">MCP server</span></a> exposed over the Streamable
+HTTP transport, reachable through the
+<code class="docutils literal notranslate"><span class="pre">ivre/web</span></code> reverse proxy at <code class="docutils literal notranslate"><span class="pre">/mcp</span></code>. Bundles
+Debian’s <code class="docutils literal notranslate"><span class="pre">nmap-common</span></code> data files under
+<code class="docutils literal notranslate"><span class="pre">/usr/share/nmap/</span></code> so the MCP
+<code class="docutils literal notranslate"><span class="pre">nmap_service_values</span></code> tool can enumerate known
+service names and products.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="using-docker-compose">
+<h2>Using docker compose<a class="headerlink" href="#using-docker-compose" title="Link to this heading"></a></h2>
+<p>The easiest way, just run:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ docker compose up
+</pre></div>
+</div>
+<p>The containers should now be running, with the TCP port 80 of your
+host redirected to the <code class="docutils literal notranslate"><span class="pre">ivreweb</span></code> container.</p>
+<p>To get a shell with the CLI tools and Python API, attach to the
+<code class="docutils literal notranslate"><span class="pre">ivreclient</span></code> container:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ docker attach ivreclient
+root@fd983ba5e6fd:/#
+</pre></div>
+</div>
+<p>You can detach from the container (without stopping it) by using
+<code class="docutils literal notranslate"><span class="pre">C-p</span> <span class="pre">C-q</span></code> and attach to it again later with the same
+<code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">attach</span> <span class="pre">ivreclient</span></code> command.</p>
+<p>To initialize the database and start playing with IVRE, you need to
+enter some commands described in the <a class="reference external" href="#initialization">related section
+below</a>.</p>
+</section>
+<section id="using-vagrant">
+<h2>Using Vagrant<a class="headerlink" href="#using-vagrant" title="Link to this heading"></a></h2>
+<p>If you already manage your Docker containers using <a class="reference external" href="https://www.vagrantup.com/">Vagrant</a>, you can use it to run the containers.</p>
+<p>With the <code class="docutils literal notranslate"><span class="pre">Vagrantfile</span></code> as it is provided, the TCP port 80 of your host
+will be used, so you need either to make sure it is not already in use,
+or to modify the <code class="docutils literal notranslate"><span class="pre">Vagrantfile</span></code> after the <code class="docutils literal notranslate"><span class="pre">cp</span></code> step in the
+instructions below to use another port.</p>
+<p>To use the <code class="docutils literal notranslate"><span class="pre">Vagrantfile</span></code> located in the <code class="docutils literal notranslate"><span class="pre">docker/</span></code> directory of the
+source tree (or the <code class="docutils literal notranslate"><span class="pre">[PREFIX]/share/ivre/docker/</span></code> directory when IVRE
+has been installed), run (from the folder where you want to store your
+data):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ mkdir -m 1777 var_lib_mongodb ivre-share dokuwiki_data
+  # For people using SELinux enforced, you need to run
+$ sudo chcon -Rt svirt_sandbox_file_t var_lib_mongodb ivre-share dokuwiki_data
+
+$ cp [path to ivre source]/docker/Vagrantfile .
+$ vagrant up --no-parallel
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">--no-parallel</span></code> option prevents Vagrant from starting the
+<code class="docutils literal notranslate"><span class="pre">ivreuwsgi</span></code> container before the <code class="docutils literal notranslate"><span class="pre">ivredb</span></code> is ready.</p>
+<p>To access the <code class="docutils literal notranslate"><span class="pre">ivreclient</span></code> container, see the <a class="reference external" href="#using-docker-compose">Using Docker Compose</a> since it is similar.</p>
+</section>
+<section id="build-the-images">
+<h2>Build the images<a class="headerlink" href="#build-the-images" title="Link to this heading"></a></h2>
+<p>By default, the images will be downloaded from the Docker Hub. But you
+also can build the images from the provided <code class="docutils literal notranslate"><span class="pre">Dockerfile</span></code>s. For
+that, from the <code class="docutils literal notranslate"><span class="pre">docker/</span></code> directory, run:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ for img in base client web web-doku web-mcp web-uwsgi ; do
+&gt; docker build -t &quot;ivre/$img&quot; &quot;$img&quot;
+&gt; done
+</pre></div>
+</div>
+<p>This might take a long time.</p>
+<section id="alternative-builds-for-the-base-image">
+<h3>Alternative builds for the base image<a class="headerlink" href="#alternative-builds-for-the-base-image" title="Link to this heading"></a></h3>
+<section id="local-archive">
+<h4>Local archive<a class="headerlink" href="#local-archive" title="Link to this heading"></a></h4>
+<p>It is also possible to build the <code class="docutils literal notranslate"><span class="pre">ivre/base</span></code> image without fetching
+the <em>tarball</em> from GitHub, by creating it locally and using the
+<code class="docutils literal notranslate"><span class="pre">base-local</span></code> directory instead of <code class="docutils literal notranslate"><span class="pre">base</span></code>. From the repository root,
+run:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ git archive --format=tar --prefix=ivre/ HEAD -o docker/base-local/ivre.tar
+$ tar --owner=root:0 --group=root:0 --transform=&#39;s#^#ivre/#&#39; -rf docker/base-local/ivre.tar ivre/_version.py
+$ docker build -t ivre/base docker/base-local
+</pre></div>
+</div>
+</section>
+<section id="using-pip">
+<h4>Using pip<a class="headerlink" href="#using-pip" title="Link to this heading"></a></h4>
+<p>Another way to create the <code class="docutils literal notranslate"><span class="pre">ivre/base</span></code> image is to use
+<a class="reference external" href="https://pypi.python.org/pypi/pip">pip</a>. From the
+<code class="docutils literal notranslate"><span class="pre">docker/</span></code> directory, run:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ docker build -t ivre/base base-pip
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+<section id="initialization">
+<h2>Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
+<p>Attach to the <code class="docutils literal notranslate"><span class="pre">ivreclient</span></code> container and run the initialization
+commands:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>user@host:~$ docker attach ivreclient
+root@ivreclient:/# yes | ivre ipinfo --init
+root@ivreclient:/# yes | ivre scancli --init
+root@ivreclient:/# yes | ivre view --init
+root@ivreclient:/# yes | ivre flowcli --init
+root@ivreclient:/# ivre ipdata --download
+</pre></div>
+</div>
+<p>Then we can integrate the Nmap results to the database
+<code class="docutils literal notranslate"><span class="pre">nmap</span></code> database and create a <code class="docutils literal notranslate"><span class="pre">view</span></code> from it:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">root</span><span class="nd">@ivreclient</span><span class="p">:</span><span class="o">/</span><span class="c1"># ivre scan2db -r -s MySource -c MyCategory /ivre-share</span>
+<span class="n">root</span><span class="nd">@ivreclient</span><span class="p">:</span><span class="o">/</span><span class="c1"># ivre db2view nmap</span>
+</pre></div>
+</div>
+<p>You can then detach from the container (<code class="docutils literal notranslate"><span class="pre">C-p</span> <span class="pre">C-q</span></code>).</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">root</span><span class="nd">@ivreclient</span><span class="p">:</span><span class="o">/</span><span class="c1"># exit</span>
+</pre></div>
+</div>
+<p>You can start the container again later by issuing:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ docker start -i ivreclient
+root@ivreclient:/#
+</pre></div>
+</div>
+<p>If you do not want to exit the shell but only detach from it, use
+<code class="docutils literal notranslate"><span class="pre">C-p</span> <span class="pre">C-q</span></code>. You can attach to it again later by issuing
+<code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">attach</span> <span class="pre">ivreclient</span></code>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="fast-install-and-first-run.html" class="btn btn-neutral float-left" title="Fast install &amp; first run" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../usage/index.html" class="btn btn-neutral float-right" title="Usage" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2011 - 2026, Pierre LALET.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

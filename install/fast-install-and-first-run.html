@@ -1,0 +1,241 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fast install &amp; first run &mdash; IVRE  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Docker" href="docker.html" />
+    <link rel="prev" title="Configuration" href="config.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            IVRE
+              <img src="../_static/logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview/index.html">Overview</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Installation</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="installation.html">Installation guidelines</a></li>
+<li class="toctree-l2"><a class="reference internal" href="config.html">Configuration</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Fast install &amp; first run</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#install-mongodb">Install MongoDB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#install-ivre">Install IVRE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#setup">Setup</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#database-init-data-download-importation">Database init, data download &amp; importation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#run-a-first-scan">Run a first scan</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#some-remarks">Some remarks</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="docker.html">Docker</a></li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../usage/index.html">Usage</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../dev/index.html">Development</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Licenses:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../license.html">IVRE: GPL v3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../license-external.html">Licenses for external files</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">IVRE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Installation</a></li>
+      <li class="breadcrumb-item active">Fast install &amp; first run</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/install/fast-install-and-first-run.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="fast-install-first-run">
+<h1>Fast install &amp; first run<a class="headerlink" href="#fast-install-first-run" title="Link to this heading"></a></h1>
+<p>This file describes the steps to install IVRE, run the first scans and
+add the results to the database with all components (scanner, web
+server, database server) on the same (Debian or Ubuntu) machine.</p>
+<p>You might also want to adapt it to your needs, architecture, etc.</p>
+<p>For another way to run IVRE easily (probably even more easily), see
+<a class="reference internal" href="docker.html#docker"><span class="std std-ref">Docker</span></a>.</p>
+<section id="install-mongodb">
+<h2>Install MongoDB<a class="headerlink" href="#install-mongodb" title="Link to this heading"></a></h2>
+<p>Follow the instructions from the MongoDB project, for example:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="http://docs.mongodb.org/manual/tutorial/install-mongodb-on-debian/">MongoDB on Debian</a></p></li>
+<li><p><a class="reference external" href="http://docs.mongodb.org/manual/tutorial/install-mongodb-on-ubuntu/">MongoDB on Ubuntu</a></p></li>
+</ul>
+</section>
+<section id="install-ivre">
+<h2>Install IVRE<a class="headerlink" href="#install-ivre" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ sudo apt -y --no-install-recommends install python3-pymongo \
+&gt;   python3-cryptography python3-bottle python3-openssl \
+&gt;   python3-pillow python3-pip apache2 libapache2-mod-wsgi-py3 \
+&gt;   dokuwiki git
+$ git clone https://github.com/ivre/ivre
+$ cd ivre
+$ sudo pip3 install . --break-system-packages
+</pre></div>
+</div>
+</section>
+<section id="setup">
+<h2>Setup<a class="headerlink" href="#setup" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ sudo -s
+# cd /var/www/html ## or depending on your version /var/www
+# rm index.html
+# ln -s /usr/local/share/ivre/web/static/* .
+# cd /var/lib/dokuwiki/data/media
+# ln -s /usr/local/share/ivre/dokuwiki/media/logo.png
+# cd /usr/share/dokuwiki
+# patch -p0 &lt; /usr/local/share/ivre/patches/dokuwiki/backlinks-20230404a.patch
+# cd /etc/apache2/mods-enabled
+# for m in rewrite.load wsgi.conf wsgi.load ; do
+&gt;   [ -L $m ] || ln -s ../mods-available/$m ; done
+# cd ../
+# echo &#39;Alias /cgi &quot;/usr/local/share/ivre/web/wsgi/app.wsgi&quot;&#39; &gt; conf-enabled/ivre.conf
+# echo &#39;&lt;Location /cgi&gt;&#39; &gt;&gt; conf-enabled/ivre.conf
+# echo &#39;SetHandler wsgi-script&#39; &gt;&gt; conf-enabled/ivre.conf
+# echo &#39;Options +ExecCGI&#39; &gt;&gt; conf-enabled/ivre.conf
+# echo &#39;Require all granted&#39; &gt;&gt; conf-enabled/ivre.conf
+# echo &#39;&lt;/Location&gt;&#39; &gt;&gt; conf-enabled/ivre.conf
+# sed -i &#39;s/^\(\s*\)#Rewrite/\1Rewrite/&#39; /etc/dokuwiki/apache.conf
+# echo &#39;WEB_GET_NOTEPAD_PAGES = &quot;localdokuwiki&quot;&#39; &gt;&gt; /etc/ivre.conf
+# service apache2 reload  ## or start
+# exit
+</pre></div>
+</div>
+<p>Open a web browser and visit <a class="reference external" href="http://localhost/">http://localhost/</a>.
+IVRE Web UI should show up, with no result of course. Click the HELP
+button to check if everything works.</p>
+</section>
+<section id="database-init-data-download-importation">
+<h2>Database init, data download &amp; importation<a class="headerlink" href="#database-init-data-download-importation" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ yes | ivre ipinfo --init
+$ yes | ivre scancli --init
+$ yes | ivre view --init
+$ yes | ivre flowcli --init
+$ sudo ivre ipdata --download
+$ sudo ivre getwebdata
+</pre></div>
+</div>
+</section>
+<section id="run-a-first-scan">
+<h2>Run a first scan<a class="headerlink" href="#run-a-first-scan" title="Link to this heading"></a></h2>
+<p>Run an Nmap scan with the options of your choice; for example, against
+a small list of routable IP addresses:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ sudo nmap -sS -Pn -p- --open --traceroute -oX scan.xml \
+&gt;          -iL targets.txt
+</pre></div>
+</div>
+<p>When the scan has terminated, import the results and create a view:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ ivre scan2db -c ROUTABLE,ROUTABLE-CAMPAIGN-001 -s MySource scan.xml
+$ ivre db2view nmap
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">-c</span></code> argument adds categories to the scan results. Categories are
+arbitrary names used to filter results. In this example, the values are
+<code class="docutils literal notranslate"><span class="pre">ROUTABLE</span></code>, meaning the results came out while scanning the entire
+reachable address space (as opposed to while scanning a specific
+network, AS or country, for example), and <code class="docutils literal notranslate"><span class="pre">ROUTABLE-CAMPAIGN-001</span></code>,
+which is the name I have chosen to mark this particular scan campaign.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">-s</span></code> argument adds a name for the source of the scan. Here again,
+it is an arbitrary name you can use to unambiguously specify the network
+access used to run the scan. This can be used later to highlight result
+differences depending on where the scans are run from.</p>
+<p>Go back to the Web UI and browse your first scan results!</p>
+</section>
+<section id="some-remarks">
+<h2>Some remarks<a class="headerlink" href="#some-remarks" title="Link to this heading"></a></h2>
+<p>There is no tool (for now) to automatically import scan results into
+the database. It is your job to do so, according to your settings.</p>
+<p>If you run very large scans (particularly against random hosts on the
+Internet), running a single Nmap process is rarely the best
+choice. Split the target into chunks and run several Nmap processes in
+parallel; <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">scan2db</span></code> will happily ingest the resulting XML
+files, and Masscan / Zgrab2 output too.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="config.html" class="btn btn-neutral float-left" title="Configuration" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="docker.html" class="btn btn-neutral float-right" title="Docker" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2011 - 2026, Pierre LALET.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
