@@ -1,0 +1,90 @@
+Active recon
+============
+
+Scanning
+--------
+
+With Nmap, Masscan or Zgrab2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can use network scanners directly:
+
+- `Nmap <http://nmap.org/>`_
+- `Masscan <https://github.com/robertdavidgraham/masscan/>`_
+- `Zgrab2 <https://zmap.io/>`_ (``http`` and ``jarm`` commands)
+- `ZDNS <https://github.com/zmap/zdns>`_
+- `Nuclei <https://github.com/projectdiscovery/nuclei>`_
+- `httpx <https://github.com/projectdiscovery/httpx>`_
+- `tlsx <https://github.com/projectdiscovery/tlsx>`_
+- `dnsx <https://github.com/projectdiscovery/dnsx>`_
+- `Dismap <https://github.com/zhzyker/dismap/>`_
+
+IVRE can insert XML output files for Nmap and Masscan, and JSON output
+files for the other tools, using the command line tool ``ivre
+scan2db``.
+
+You can insert scan results from different tools, then use ``ivre
+db2view nmap`` to merge results from different scans and create a view
+you can explore with the the :ref:`usage/web-ui:Web User Interface`,
+the ``ivre view`` command line tool or the Python API
+(``ivre.db.db.view.*``).
+
+Splitting wide scans
+~~~~~~~~~~~~~~~~~~~~
+
+Masscan does not provide results as complete as Nmap, when using the
+"interesting" options (for example, ``-vv -A``) or scripts. That being
+said, Nmap (with such "interesting" options) cannot run efficiently
+against huge networks.
+
+A common pattern is therefore to split the target into chunks and run
+several Nmap processes in parallel, each producing its own XML file.
+``ivre ipcalc`` can help slice address ranges or address-list files
+into chunks. Once the per-chunk XML files have been produced, ingest
+them with ``ivre scan2db`` and create a view:
+
+::
+
+   $ ivre scan2db -c ROUTABLE-001 -s MySource -r scans/
+   $ ivre db2view nmap
+
+Enjoying the results
+--------------------
+
+You have several options, depending on what you want to do:
+
+- Command line interfaces: the ``ivre scancli`` tool.
+
+- Python API: use the ``db.nmap`` object of the ``ivre.db`` module.
+
+- Web API: ``/cgi/scans``.
+
+If you want to combine several tools, for example Masscan and Nuclei
+results, you need to use a view: run ``ivre db2view nmap`` to create
+or update a view from the scan data, that can then be accessed by the
+``view`` purpose (see :ref:`overview/principles:Purposes`), which
+includes the :ref:`usage/web-ui:Web User Interface`.
+
+CLI
+~~~
+
+To get all the hosts with the port 22 open:
+
+::
+
+   $ ivre scancli --port 22
+
+See the output of ``ivre help scancli``.
+
+Python module
+~~~~~~~~~~~~~
+
+To use the Python module, run for example:
+
+::
+
+   $ python
+   >>> from ivre.db import db
+   >>> db.nmap.get(db.nmap.flt_empty)[0]
+
+For more, run ``help(db.nmap)`` from the Python shell.
