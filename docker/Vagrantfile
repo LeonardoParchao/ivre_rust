@@ -1,0 +1,109 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# This file is part of IVRE.
+# Copyright 2011 - 2023 Pierre LALET <pierre@droids-corp.org>
+#
+# IVRE is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IVRE is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
+
+#
+# Create the directories to store the logs and data:
+#
+# $ mkdir -m 1777 var_lib_mongodb ivre-share dokuwiki_data
+#
+#
+# If you have SELinux enforced, run:
+#
+# $ sudo chcon -Rt svirt_sandbox_file_t var_lib_mongodb ivre-share dokuwiki_data
+#
+#
+# Then start the containers with:
+#
+# $ vagrant up --no-parallel
+#
+
+
+ENV['VAGRANT_DEFAULT_PROVIDER'] = 'docker'
+ENV['VAGRANT_CHECKPOINT_DISABLE'] = 'true'
+
+VAGRANTFILE_API_VERSION = "2"
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+
+  # Common options
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # The DB server
+  config.vm.define 'ivredb' do |db|
+    db.vm.provider "docker" do |docker|
+      docker.image = 'mongo'
+      docker.name = 'ivredb'
+    end
+    db.vm.synced_folder "var_lib_mongodb", "/data/db"
+  end
+
+  # The PHP Dokuwiki server
+  config.vm.define 'ivredoku' do |doku|
+    doku.vm.provider "docker" do |docker|
+      docker.image = 'ivre/web-doku'
+      docker.name = 'ivredoku'
+    end
+    doku.vm.synced_folder "dokuwiki_data", "/var/www/dokuwiki/data"
+  end
+
+  # The uwsgi IVRE server
+  config.vm.define 'ivreuwsgi' do |uwsgi|
+    uwsgi.vm.provider "docker" do |docker|
+      docker.link('ivredb:ivredb')
+      docker.image = 'ivre/web-uwsgi'
+      docker.name = 'ivreuwsgi'
+    end
+    uwsgi.vm.synced_folder "dokuwiki_data", "/var/www/dokuwiki/data"
+  end
+
+  # The IVRE MCP (Model Context Protocol) server
+  config.vm.define 'ivremcp' do |mcp|
+    mcp.vm.provider "docker" do |docker|
+      docker.link('ivredb:ivredb')
+      docker.image = 'ivre/web-mcp'
+      docker.name = 'ivremcp'
+    end
+  end
+
+  # The Web server
+  config.vm.define 'ivreweb' do |web|
+    web.vm.provider "docker" do |docker|
+      docker.link('ivredoku:ivredoku')
+      docker.link('ivreuwsgi:ivreuwsgi')
+      docker.link('ivremcp:ivremcp')
+      docker.image = 'ivre/web'
+      docker.name = 'ivreweb'
+    end
+    web.vm.synced_folder "dokuwiki_data", "/var/www/dokuwiki/data"
+    web.vm.network "forwarded_port", guest: 80, host: 80
+  end
+
+  # The command line client
+  config.vm.define 'ivreclient' do |client|
+    client.vm.provider "docker" do |docker|
+      docker.link('ivredb:ivredb')
+      docker.image = 'ivre/client'
+      docker.name = 'ivreclient'
+      docker.create_args = ['-i', '-t']
+    end
+    client.vm.synced_folder "ivre-share", "/ivre-share"
+  end
+
+end
