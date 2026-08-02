@@ -1,0 +1,316 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HTTP Routing Table &mdash; IVRE  documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="_static/graphviz.css?v=4ae1632d" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+ 
+
+    <script>
+      DOCUMENTATION_OPTIONS.COLLAPSE_INDEX = true;
+    </script>
+
+
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            IVRE
+              <img src="_static/logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="overview/index.html">Overview</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="install/index.html">Installation</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="usage/index.html">Usage</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="dev/index.html">Development</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Licenses:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="license.html">IVRE: GPL v3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="license-external.html">Licenses for external files</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">IVRE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">HTTP Routing Table</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+
+   <h1>HTTP Routing Table</h1>
+
+   <div class="modindex-jumpbox">
+   <a href="#cap-/(subdb:re:scans|view)"><strong>/(subdb:re:scans|view)</strong></a> | 
+   <a href="#cap-/(subdb:re:scans|view|passive|rir)"><strong>/(subdb:re:scans|view|passive|rir)</strong></a> | 
+   <a href="#cap-/audit"><strong>/audit</strong></a> | 
+   <a href="#cap-/auth"><strong>/auth</strong></a> | 
+   <a href="#cap-/config"><strong>/config</strong></a> | 
+   <a href="#cap-/dns"><strong>/dns</strong></a> | 
+   <a href="#cap-/flows"><strong>/flows</strong></a> | 
+   <a href="#cap-/ipdata"><strong>/ipdata</strong></a> | 
+   <a href="#cap-/iprange"><strong>/iprange</strong></a> | 
+   <a href="#cap-/notes"><strong>/notes</strong></a> | 
+   <a href="#cap-/passive"><strong>/passive</strong></a> | 
+   <a href="#cap-/passivedns"><strong>/passivedns</strong></a> | 
+   <a href="#cap-/rir"><strong>/rir</strong></a>
+   </div>
+
+   <table class="indextable modindextable">
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/(subdb:re:scans|view)"><td></td><td>
+       <strong>/(subdb:re:scans|view)</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--(subdb-re-scans|view)"><code class="xref">GET /(subdb:re:scans|view)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--(subdb-re-scans|view)-(action-re-onlyips|ipsports|timeline|coordinates|countopenports|diffcats)"><code class="xref">GET /(subdb:re:scans|view)/(action:re:onlyips|ipsports|timeline|coordinates|countopenports|diffcats)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--(subdb-re-scans|view)-count"><code class="xref">GET /(subdb:re:scans|view)/count</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#post--(subdb-re-scans|view)"><code class="xref">POST /(subdb:re:scans|view)</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/(subdb:re:scans|view|passive|rir)"><td></td><td>
+       <strong>/(subdb:re:scans|view|passive|rir)</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--(subdb-re-scans|view|passive|rir)-distinct-(field-path)"><code class="xref">GET /(subdb:re:scans|view|passive|rir)/distinct/(field:path)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--(subdb-re-scans|view|passive|rir)-top-(field-path)"><code class="xref">GET /(subdb:re:scans|view|passive|rir)/top/(field:path)</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/audit"><td></td><td>
+       <strong>/audit</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--audit-"><code class="xref">GET /audit/</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--audit-(event_id)"><code class="xref">GET /audit/(event_id)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--audit-count"><code class="xref">GET /audit/count</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/auth"><td></td><td>
+       <strong>/auth</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--auth-check"><code class="xref">GET /auth/check</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/config"><td></td><td>
+       <strong>/config</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--config"><code class="xref">GET /config</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/dns"><td></td><td>
+       <strong>/dns</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--dns"><code class="xref">GET /dns</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/flows"><td></td><td>
+       <strong>/flows</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--flows"><code class="xref">GET /flows</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#post--flows"><code class="xref">POST /flows</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#post--flows-cleanup"><code class="xref">POST /flows/cleanup</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/ipdata"><td></td><td>
+       <strong>/ipdata</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--ipdata-(addr)"><code class="xref">GET /ipdata/(addr)</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/iprange"><td></td><td>
+       <strong>/iprange</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--iprange"><code class="xref">GET /iprange</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/notes"><td></td><td>
+       <strong>/notes</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--notes-"><code class="xref">GET /notes/</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--notes-(entity_type)-(entity_key)"><code class="xref">GET /notes/(entity_type)/(entity_key)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--notes-(entity_type)-(entity_key)-revisions"><code class="xref">GET /notes/(entity_type)/(entity_key)/revisions</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#put--notes-(entity_type)-(entity_key)"><code class="xref">PUT /notes/(entity_type)/(entity_key)</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#delete--notes-(entity_type)-(entity_key)"><code class="xref">DELETE /notes/(entity_type)/(entity_key)</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/passive"><td></td><td>
+       <strong>/passive</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--passive"><code class="xref">GET /passive</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--passive-count"><code class="xref">GET /passive/count</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/passivedns"><td></td><td>
+       <strong>/passivedns</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--passivedns-(query-path)"><code class="xref">GET /passivedns/(query:path)</code></a></td><td>
+       <em></em></td></tr>
+     <tr class="pcap"><td></td><td>&#160;</td><td></td></tr>
+     <tr class="cap" id="cap-/rir"><td></td><td>
+       <strong>/rir</strong></td><td></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--rir"><code class="xref">GET /rir</code></a></td><td>
+       <em></em></td></tr>
+     <tr>
+       <td></td>
+       <td>
+       <a href="dev/web-api.html#get--rir-count"><code class="xref">GET /rir/count</code></a></td><td>
+       <em></em></td></tr>
+   </table>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2011 - 2026, Pierre LALET.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
