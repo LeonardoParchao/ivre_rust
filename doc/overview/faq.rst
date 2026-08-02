@@ -1,0 +1,188 @@
+FAQ
+===
+
+If you cannot find the answer to your question, either here or in this
+documentation, feel free to `open an issue
+<https://github.com/ivre/ivre/issues/new>`_ and use the label
+"question".
+
+Web interface
+-------------
+
+Notebook shows "Forbidden"
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**I cannot access the notepad (the Dokuwiki content), and get a
+"Forbidden" message.**
+
+You need to configure your web server to allow access from other hosts
+on the network to the Dokuwiki content. It is often restricted, by
+default, to local users only. If you are using Apache, you can look
+for an ACL like ``Allow from localhost 127.0.0.1 ::1`` and adapt it to
+your network.
+
+The Web interface shows no result
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**I have inserted scan results, yet when I open the Web interface, it
+remains empty.**
+
+Two problems can explain this situation:
+
+- The results are stored in the scan collection, but no view has been
+  created (the Web interface displays results from the view).
+- The Web interface does not access the database for some reason.
+
+First, from the command line, check that a view has been created by
+running ``ivre view --count``. If it displays ``0``, it means that
+while you have inserted results in the ``scan`` database, you have not
+updated the ``view`` (see :ref:`overview/principles:Purposes`). You
+can create a view by using the ``ivre db2view`` CLI tool.
+
+If ``ivre view --count`` does not display ``0`` but a (positive!)
+number, it means that, for some reason, the CGI cannot access the
+database. It could be because you are using a user-specific
+configuration (in ``~/.ivre.conf``) and the CGI application runs with
+a different user. To investigate the problem, you have to check the
+Web server error logs.
+
+How can I restrict access to IVRE's Web interface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**I want to prevent unauthorized access to IVRE's results.**
+
+There are two ways to handle authentication:
+
+- **Built-in authentication**: IVRE supports OAuth providers (GitHub,
+  Google, Microsoft, Generic OIDC), magic links (via email), and API
+  keys. See :doc:`/usage/web-auth` for the complete documentation.
+
+- **Web server authentication**: configure your web server (Apache,
+  nginx, etc.) to handle the authentication (HTTP Basic, LDAP, AD,
+  Kerberos, SAML, client certificates, etc.) and set the
+  ``REMOTE_USER`` environment variable. See
+  :doc:`/usage/web-auth` for how IVRE uses ``REMOTE_USER``.
+
+Both options can be combined (see :doc:`/usage/web-auth`).
+
+To restrict access to the results based on the user login or domain,
+add the following lines to ``/etc/ivre.conf``:
+
+::
+
+   WEB_DEFAULT_INIT_QUERY = 'noaccess'
+   WEB_INIT_QUERIES = {
+       'admin@SUBNETWORK.NETWORK.AD': 'category:SubNetwork',
+       '@ADMIN.NETWORK.AD': 'full',
+   }
+
+By default, users won't have access to any result. The user
+``admin@SUBNETWORK.NETWORK.AD`` will have access to the results in the
+category ``SubNetwork``. The users in the ``ADMIN.NETWORK.AD`` realm
+will have access to all the results.
+
+Scanning the Internet is slow!
+------------------------------
+
+This is based on `issue GH#822
+<https://github.com/ivre/ivre/issues/822>`_.
+
+When scanning a wide target with ``nmap``, one can notice the scan
+really takes a long time to terminate.
+
+IVRE itself is not the bottleneck: it merely ingests the XML produced
+by your scanner. You would get the same throughput running Nmap
+directly.
+
+That being said, here are several ways to speed up a scan.
+
+Use Masscan rather that Nmap
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is pretty radical, and has an important drawback: Masscan
+results gather less intelligence than Nmap (a lot less in some
+situations).
+
+However, it is often the only option to get comprehensive scans of the
+IPv4 routable address space.
+
+A trade-off could be, for some protocols, to use Zmap /
+Zgrab2. Compare the possibilities of Masscan (``--banner``) versus
+Zgrab2 for the protocol(s) you want to scan.
+
+IVRE will happily combine results from Nmap, Masscan and Zgrab /
+Zgrab2: you can build your own, perfectly suited, scanning solution
+and use IVRE to merge and browse the results.
+
+Parallelize Nmap scans
+~~~~~~~~~~~~~~~~~~~~~~
+
+Another option is to run several Nmap processes in parallel rather
+than one. Theoretically it should not help (Nmap manages its own
+resources), but it has proven useful in practice, particularly when
+scanning heavily filtered hosts or random hosts across the Internet.
+
+Split the target into chunks (for instance with ``ivre ipcalc`` or any
+other tool), launch several ``nmap`` processes against each chunk, and
+ingest the resulting XML files with ``ivre scan2db``.
+
+Can IVRE be used to look for XXX?
+---------------------------------
+
+IVRE is not a scanner or a network traffic analyzer. It relies on
+tools like Nmap, Masscan, ZGrab2, and Zeek, parses their results and
+stores them in a database.
+
+So when you are asking, for example, "can IVRE scan a network for
+hosts with the `Heartbleed
+<https://en.wikipedia.org/wiki/Heartbleed>`_ vulnerability?", in
+reality you are asking two different questions:
+
+- "Can Nmap or Masscan or Zgrab2 detect when a scanned hosts is
+  vulnerable to the Heartbleed vulnerability?"
+- "How can IVRE list the hosts that have been found vulnerable to
+  Heartbleed by Nmap or Masscan?"
+
+The first question is not related to IVRE (and should probably be
+asked to Nmap, Masscan or Zgrab2 developers), but the second question
+is (and may be asked as a `"question" labeled issue
+<https://github.com/ivre/ivre/issues/new?labels=question>`_).
+
+For that particular Heartbleed example, Nmap, Masscan and Zgrab2 can
+(reliably) report hosts with the Heartbleed vulnerability, and IVRE
+can be used to find such hosts.
+
+How can I configure iptables to get logs used by flow2db tool
+-------------------------------------------------------------
+
+When you don't have access to low level network data, an easy way to
+discover a part of network traffic is to use netfilter logs collected
+via syslog.
+
+To be efficient, all the systems must have iptables activated and
+configured to send logs.
+
+For example
+
+::
+
+      -A INPUT   -j LOG --log-prefix "IPTABLES/INPUT: "
+      -A OUTPUT  -j LOG --log-prefix "IPTABLES/OUTPUT: "
+      -A FORWARD -j LOG --log-prefix "IPTABLES/FORWARD: "
+
+To log all traffic, the rules can be set at the top of all rules. Be
+careful with the OUTPUT rule if the logs are sent over the network!
+
+On the syslog server or on each host, just run grep to collect the
+data needed for the iptables flow2db parser:
+
+.. code:: bash
+
+      $ grep -l 'IPTABLES/' /var/log/syslog /var/log/kernel.log ... \
+          > syslog-iptables.log
+
+Then import data to ivredb using flow2db tool:
+
+.. code:: bash
+
+      $ ivre flow2db -t iptables syslog-iptables.log
