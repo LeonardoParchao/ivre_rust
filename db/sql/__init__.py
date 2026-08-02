@@ -1,0 +1,7235 @@
+#! /usr/bin/env python
+
+# This file is part of IVRE.
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
+#
+# IVRE is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IVRE is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
+"""This module contains functions to interact with *ANY* SQL database."""
+
+# Tests like "expr == None" should be used for BinaryExpression instances
+# pylint: disable=singleton-comparison
+
+
+import csv
+import datetime
+import hashlib
+import json
+import re
+import uuid
+from collections import namedtuple
+from collections.abc import Iterator
+from secrets import token_urlsafe
+from typing import Any
+
+from sqlalchemy import (
+    Boolean,
+    Integer,
+    and_,
+    cast,
+    column,
+    create_engine,
+    delete,
+    desc,
+    exists,
+    func,
+    insert,
+    join,
+    not_,
+    null,
+    nulls_first,
+    or_,
+    select,
+)
+from sqlalchemy import text as sa_text
+from sqlalchemy import (
+    true,
+    update,
+)
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
+
+from ivre import config
+from ivre import flow as ivre_flow
+from ivre import utils, xmlnmap
+from ivre.active.nmap import ALIASES_TABLE_ELEMS
+from ivre.db import (
+    DB,
+    AuditWriteError,
+    DBActive,
+    DBAudit,
+    DBAuth,
+    DBFlow,
+    DBNmap,
+    DBPassive,
+    DBRir,
+    DBView,
+)
+from ivre.db.sql import tables as tables_module
+from ivre.db.sql.tables import (
+    RIR_FTS_COLUMNS,
+    AuditEvent,
+    AuthApiKey,
+    AuthMagicLink,
+    AuthRateLimit,
+    AuthSession,
+    AuthUser,
+    Flow,
+    Host,
+    N_Association_Scan_Category,
+    N_Association_Scan_Hostname,
+    N_Category,
+    N_Hop,
+    N_Hostname,
+    N_Port,
+    N_Scan,
+    N_Script,
+    N_Tag,
+    N_Trace,
+    Passive,
+    Point,
+    Rir,
+    V_Association_Scan_Category,
+    V_Association_Scan_Hostname,
+    V_Category,
+    V_Hop,
+    V_Hostname,
+    V_Port,
+    V_Scan,
+    V_Script,
+    V_Tag,
+    V_Trace,
+)
+
+# Data
+
+
+class CSVFile:
+    """A file like object generating CSV lines suitable for use with
+    PostgresDB.copy_from(). Reads (at most `limit`, when it's not None)
+    lines from `fname`, skipping `skip` first lines.
+
+    When .read() returns the empty string, the attribute `.more_to_read`
+    is set to True when the `limit` has been reached, and to False when
+    there is no more data to read from the input.
+
+    """
+
+    def __init__(self, fname, skip=0, limit=None):
+        # pylint: disable=consider-using-with
+        self.fdesc = open(fname, encoding="latin-1")
+        for _ in range(skip):
+            self.fdesc.readline()
+        self.limit = limit
+        if limit is not None:
+            self.count = 0
+        self.more_to_read = None
+        self.inp = csv.reader(self.fdesc)
+
+    @staticmethod
+    def fixline(line):
+        """Subclasses can override this method to generate the CSV line from
+        the original line.
+
+        """
+        return line
+
+    def read(self, size=None):
+        if self.limit is not None:
+            if self.count >= self.limit:
+                self.more_to_read = True
+                return ""
+        try:
+            line = None
+            while line is None:
+                line = self.fixline(next(self.inp))
+            if self.limit is not None:
+                self.count += 1
+            return "%s\n" % "\t".join(line)
+        except StopIteration:
+            self.more_to_read = False
+            return ""
+
+    def readline(self):
+        return self.read()
+
+    def __exit__(self, *args):
+        if self.fdesc is not None:
+            self.fdesc.__exit__(*args)
+
+    def __enter__(self):
+        return self
+
+
+# Nmap
+
+
+class ScanCSVFile(CSVFile):
+    def __init__(self, hostgen, ip2internal, table):
+        self.ip2internal = ip2internal
+        self.table = table
+        self.inp = hostgen
+        self.fdesc = None
+
+    def fixline(self, line):
+        for field in ["extraports", "openports", "traces"]:
+            line.pop(field, None)
+        line["addr"] = self.ip2internal(line["addr"])
+        line["time_start"] = line.pop("starttime")
+        line["time_stop"] = line.pop("endtime")
+        line["info"] = line.pop("infos", None)
+        for field in ["categories"]:
+            if field in line:
+                line[field] = "{%s}" % json.dumps(line[field])[1:-1]
+        for port in line.get("ports", []):
+            for script in port.get("scripts", []):
+                if "masscan" in script and "raw" in script["masscan"]:
+                    script["masscan"]["raw"] = utils.encode_b64(
+                        script["masscan"]["raw"]
+                    )
+                if "ssl-cert" in script:
+                    for cert in script["ssl-cert"]:
+                        for fld in ["not_before", "not_after"]:
+                            if fld not in cert:
+                                continue
+                            if isinstance(cert[fld], datetime.datetime):
+                                cert[fld] = cert[fld].timestamp()
+                            elif isinstance(cert[fld], str):
+                                cert[fld] = utils.all2datetime(cert[fld]).timestamp()
+            if "screendata" in port:
+                port["screendata"] = utils.encode_b64(port["screendata"])
+        for field in ["hostnames", "ports", "info", "cpes", "os", "addresses"]:
+            if field in line:
+                line[field] = json.dumps(line[field]).replace("\\", "\\\\")
+        return [
+            "\\N" if line.get(col.name) is None else str(line.get(col.name))
+            for col in self.table.columns
+        ]
+
+
+# Passive
+class PassiveCSVFile(CSVFile):
+    info_fields = set(["distance", "signature", "version"])
+
+    def __init__(
+        self,
+        siggen,
+        ip2internal,
+        table,
+        limit=None,
+        getinfos=None,
+        separated_timestamps=True,
+    ):
+        self.ip2internal = ip2internal
+        self.table = table
+        self.inp = siggen
+        self.fdesc = None
+        self.limit = limit
+        if limit is not None:
+            self.count = 0
+        self.getinfos = getinfos
+        self.timestamps = separated_timestamps
+
+    def fixline(self, line):
+        if self.timestamps:
+            timestamp, line = line
+            line["firstseen"] = line["lastseen"] = utils.all2datetime(timestamp)
+        else:
+            line["firstseen"] = utils.all2datetime(line["firstseen"])
+            line["lastseen"] = utils.all2datetime(line["lastseen"])
+        if self.getinfos is not None:
+            line.update(self.getinfos(line))
+            try:
+                line.update(line.pop("infos"))
+            except KeyError:
+                pass
+        if "addr" in line:
+            line["addr"] = self.ip2internal(line["addr"])
+        else:
+            line["addr"] = None
+        line.setdefault("count", 1)
+        line.setdefault("port", -1)
+        for key in ["sensor", "value", "source", "targetval"]:
+            line.setdefault(key, "")
+        if line["recontype"] in {"SSL_SERVER", "SSL_CLIENT"} and line["source"] in {
+            "cert",
+            "cacert",
+        }:
+            for fld in ["not_before", "not_after"]:
+                if fld not in line:
+                    continue
+                if isinstance(line[fld], datetime.datetime):
+                    line[fld] = line[fld].timestamp()
+                elif isinstance(line[fld], str):
+                    line[fld] = utils.all2datetime(line[fld]).timestamp()
+        for key, value in line.items():
+            if key not in ["info", "moreinfo"] and isinstance(value, str):
+                try:
+                    value = value.encode("latin-1")
+                except Exception:
+                    pass
+                line[key] = "".join(
+                    chr(c) if 32 <= c <= 126 else f"\\x{c:02x}" for c in value
+                ).replace("\\", "\\\\")
+        line["info"] = json.dumps(
+            {key: line.pop(key) for key in list(line) if key in self.info_fields}
+        ).replace("\\", "\\\\")
+        line["moreinfo"] = json.dumps(
+            {key: line.pop(key) for key in list(line) if key not in self.table.columns}
+        ).replace("\\", "\\\\")
+        return [
+            "\\N" if line.get(col.name) is None else str(line.get(col.name))
+            for col in self.table.columns
+        ]
+
+
+class _BufferedResult:
+    """Lightweight stand-in for a SQLAlchemy ``CursorResult`` that
+    has already drained its rows.  Returned by
+    :meth:`SQLDB._write` so callers can ``.fetchone()`` /
+    ``.fetchall()`` *after* the writer's transactional ``with``
+    block has closed the underlying connection.
+
+    DuckDB's ``duckdb-engine`` invalidates a cursor's result set
+    when the parent connection returns to the pool::
+
+        InvalidInputException: No open result set
+
+    PostgreSQL (``psycopg2``) happens to buffer the rows
+    client-side at execute time, so the same code path worked
+    there by accident: every existing
+    ``self._write(stmt).fetchone()[0]`` call site (e.g. in
+    :meth:`PostgresDB._store_host` for ``RETURNING n_scan.id``)
+    fetches *after* the connection has closed, which only
+    works because psycopg2's pre-buffered rows survive the
+    close.  Materialising the rows once and replaying them
+    from this wrapper keeps the existing call-site contract
+    without forcing every caller into the
+    ``with self.db.begin() ...`` boilerplate.
+    """
+
+    __slots__ = ("_rows", "_iter", "rowcount")
+
+    def __init__(self, rows: list[Any], rowcount: int) -> None:
+        self._rows = list(rows)
+        self._iter = iter(self._rows)
+        self.rowcount = rowcount
+
+    def fetchone(self) -> Any:
+        return next(self._iter, None)
+
+    def fetchall(self) -> list[Any]:
+        rest = list(self._iter)
+        self._iter = iter(())
+        return rest
+
+    def first(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._rows)
+
+
+class SQLDB(DB):
+    table_layout = namedtuple("empty_layout", [])
+    tables = table_layout()
+    fields = {}
+    no_limit = None
+
+    def __init__(self, url):
+        super().__init__()
+        # ``urlparse(...).geturl()`` (and ``urlunparse``) collapse
+        # the empty-authority ``///`` separator down to a single
+        # ``/`` for any scheme that does not opt into
+        # ``urllib.parse.uses_netloc``: e.g.
+        # ``duckdb:///:memory:`` would round-trip as
+        # ``duckdb:/:memory:``, which SQLAlchemy then refuses with
+        # ``Could not parse SQLAlchemy URL from given URL string``.
+        # Reconstruct the wire form explicitly so empty-host URLs
+        # (DuckDB embedded files, ``:memory:``) survive untouched
+        # while PostgreSQL / MongoDB / Elasticsearch URLs --- which
+        # always carry a non-empty netloc --- come out byte-for-byte
+        # identical to what ``geturl()`` returned previously.
+        rebuilt = f"{url.scheme}://{url.netloc}{url.path}"
+        if url.params:
+            rebuilt += f";{url.params}"
+        if url.query:
+            rebuilt += f"?{url.query}"
+        if url.fragment:
+            rebuilt += f"#{url.fragment}"
+        self.dburl = rebuilt
+
+    @property
+    def db(self):
+        """The DB connection."""
+        try:
+            return self._db
+        except AttributeError:
+            # echo on debug disabled for tests
+            self._db = create_engine(self.dburl, echo=config.DEBUG_DB)
+            return self._db
+
+    @property
+    def flt_empty(self):
+        return self.base_filter()
+
+    def drop(self):
+        with self.db.begin() as conn:
+            for table in reversed(self.tables):
+                table.__table__.drop(bind=conn, checkfirst=True)
+
+    def create(self):
+        with self.db.begin() as conn:
+            for table in self.tables:
+                table.__table__.create(bind=conn, checkfirst=True)
+
+    def init(self):
+        self.drop()
+        self.create()
+
+    def _read(self, stmt):
+        """Execute a read statement and return the materialised list
+        of result rows. Wraps the legacy ``Engine.execute(stmt)``
+        idiom in a 2.x-style ``with engine.connect()`` block so the
+        migration to SQLAlchemy 2.x reduces to one helper call per
+        legacy site.
+
+        Returns the rows eagerly so callers can iterate without
+        keeping the underlying connection open. Streamed reads
+        (large cursors) should use :meth:`_read_iter` instead.
+        """
+        with self.db.connect() as conn:
+            return conn.execute(stmt).fetchall()
+
+    def _read_iter(self, stmt):
+        """Like :meth:`_read` but yields rows one at a time, holding
+        the connection open for the duration of the iteration. Use
+        for unbounded / large result sets where eager
+        materialisation would be wasteful."""
+        with self.db.connect() as conn:
+            yield from conn.execute(stmt)
+
+    def _read_one(self, stmt):
+        """Execute a read statement and return the first row, or
+        ``None`` if the result set is empty."""
+        with self.db.connect() as conn:
+            return conn.execute(stmt).fetchone()
+
+    def _write(self, stmt):
+        """Execute a write statement (INSERT / UPDATE / DELETE) inside
+        a transactional block.  Returns a buffered result object
+        so callers can read ``rowcount`` / ``fetchone()[0]`` /
+        ``fetchall()`` etc. *after* the connection / transaction
+        has closed.
+
+        On PostgreSQL (psycopg2) the underlying cursor's result
+        set survives the surrounding ``with`` block by accident:
+        psycopg2 buffers the rows on the client side at execute
+        time, so a post-close ``.fetchone()`` works.  DuckDB's
+        client (``duckdb-engine``) ties the result set to the
+        live cursor and raises
+        ``InvalidInputException: No open result set`` once the
+        connection is returned to the pool.  Materialising the
+        rows here keeps every backend on the same contract.
+        """
+        with self.db.begin() as conn:
+            result = conn.execute(stmt)
+            rows = result.fetchall() if result.returns_rows else []
+            return _BufferedResult(rows, result.rowcount)
+
+    def explain(self, req, **_):
+        """This method calls the SQL EXPLAIN statement to retrieve database
+        statistics.
+        """
+        raise NotImplementedError()
+
+    def _get(self, flt, limit=None, skip=None, sort=None, fields=None):
+        raise NotImplementedError()
+
+    @staticmethod
+    def ip2internal(addr):
+        # required for use with ivre.db.sql.tables.DefaultINET() (see
+        # .bind_processor()). Backends using variants must implement
+        # their own methods.
+        if not addr:
+            return b""
+        return utils.ip2bin(addr)
+
+    @staticmethod
+    def internal2ip(addr):
+        # required for use with ivre.db.sql.tables.DefaultINET() (see
+        # .result_processor()). Backends using variants must implement
+        # their own methods.
+        if not addr:
+            return None
+        return utils.bin2ip(addr)
+
+    @staticmethod
+    def to_binary(data):
+        return utils.encode_b64(data).decode()
+
+    @staticmethod
+    def from_binary(data):
+        return utils.decode_b64(data.encode())
+
+    @staticmethod
+    def flt2str(flt):
+        result = {}
+        for queryname, queries in flt.all_queries.items():
+            outqueries = []
+            if not isinstance(queries, list):
+                queries = [queries]
+            for query in queries:
+                if query is not None:
+                    outqueries.append(str(query))
+            if outqueries:
+                result[queryname] = outqueries
+        return json.dumps(result)
+
+    def create_indexes(self):
+        raise NotImplementedError()
+
+    def ensure_indexes(self):
+        """Idempotently create every table declared on this
+        backend and every :class:`Index` attached to those
+        tables, without touching the rows already present.
+
+        Operator-facing CLIs (``scancli`` / ``view`` /
+        ``passive`` / ``flowcli`` / ``auditcli`` / ...) all
+        expose an ``--ensure-indexes`` subcommand that calls
+        this method.  Before this generalisation the base
+        raised :class:`NotImplementedError`, so every SQL
+        deployment would crash with a traceback on those
+        subcommands even though the purposes themselves were
+        fully wired against PostgreSQL / DuckDB.
+
+        Why not :meth:`Index.create` with ``checkfirst=True``
+        and / or the SQLAlchemy
+        :class:`~sqlalchemy.engine.Inspector` ?
+
+        * The duckdb-engine dialect does not translate
+          ``checkfirst`` into ``CREATE INDEX IF NOT EXISTS``
+          semantics: a second invocation against the same
+          database raises ``CatalogException: Index with name
+          "..." already exists``.
+        * Its inspector explicitly does not reflect indexes
+          either -- it warns ``duckdb-engine doesn't yet
+          support reflection on indices`` and returns ``[]``,
+          so the inspector-based "create only what's missing"
+          trick degenerates into "always create, always crash
+          on rerun".
+
+        Wrapping each ``CREATE INDEX`` in its own transaction
+        and treating a :class:`SQLAlchemyError` whose message
+        contains ``"already exists"`` as the success path
+        gives portable idempotency without depending on either
+        backend's catalog semantics: PostgreSQL's
+        ``DuplicateObjectError`` and DuckDB's
+        ``CatalogException`` both surface through SQLAlchemy
+        2.x with that substring in :func:`str`.  Other
+        :class:`SQLAlchemyError` instances (permission denied,
+        dialect bug, ...) still propagate so a real schema
+        problem surfaces loudly.
+
+        :class:`~sqlalchemy.UniqueConstraint` declarations
+        attached to a :class:`~sqlalchemy.Table` (e.g.
+        ``audit_events_idx_event_id`` on :class:`AuditEvent`)
+        are created with the table itself rather than via
+        :class:`Index`, so they do not appear in
+        ``table.indexes`` and the loop below does not need to
+        special-case them: the
+        ``Table.create(checkfirst=True)`` line above creates
+        them as part of the ``CREATE TABLE`` statement on the
+        first call and short-circuits on every subsequent
+        call.
+        """
+        # First pass: ensure each table exists.  ``checkfirst``
+        # makes this a clean no-op when the table is already
+        # there -- both PostgreSQL and DuckDB honour it for
+        # ``CREATE TABLE`` (the dialect quirk is index-only).
+        with self.db.begin() as conn:
+            for table in self.tables:
+                table.__table__.create(bind=conn, checkfirst=True)
+        # Second pass: each index in its own transaction so a
+        # duplicate on one index does not poison the rest of
+        # the run.  A shared transaction would abort on the
+        # first ``CatalogException``, leaving subsequent
+        # indexes uncreated; the per-index loop guarantees
+        # that every missing index is eventually created
+        # regardless of how many already exist.
+        for table in self.tables:
+            for index in table.__table__.indexes:
+                try:
+                    with self.db.begin() as conn:
+                        index.create(bind=conn)
+                except SQLAlchemyError as exc:
+                    if "already exists" not in str(exc):
+                        raise
+                    utils.LOGGER.debug(
+                        "%s.ensure_indexes: %s already exists, skipping",
+                        type(self).__name__,
+                        index.name,
+                    )
+
+    @staticmethod
+    def query(*args, **kargs):
+        raise NotImplementedError()
+
+    def run(self, query):
+        raise NotImplementedError()
+
+    @classmethod
+    def from_dbdict(cls, d):
+        raise NotImplementedError()
+
+    @classmethod
+    def from_dbprop(cls, prop, val):
+        raise NotImplementedError()
+
+    @classmethod
+    def to_dbdict(cls, d):
+        raise NotImplementedError()
+
+    @classmethod
+    def to_dbprop(cls, prop, val):
+        raise NotImplementedError()
+
+    # FIXME: move this method
+    @classmethod
+    def _date_round(cls, date):
+        if isinstance(date, datetime.datetime):
+            ts = date.timestamp()
+        else:
+            ts = date
+        ts = ts - (ts % config.FLOW_TIME_PRECISION)
+        if isinstance(date, datetime.datetime):
+            return datetime.datetime.fromtimestamp(ts)
+        return ts
+
+    @staticmethod
+    def fmt_results(fields, result):
+        return {fld: value for fld, value in zip(fields, result) if value is not None}
+
+    @classmethod
+    def searchobjectid(cls, oid, neg=False):
+        """Filters records by their ObjectID.  `oid` can be a single or many
+        (as a list or any iterable) object ID(s), specified as strings
+        or an `ObjectID`s.
+
+        """
+        if isinstance(oid, (int, str)):
+            oid = [int(oid)]
+        else:
+            oid = [int(suboid) for suboid in oid]
+        return cls._searchobjectid(oid, neg=neg)
+
+    @staticmethod
+    def _searchobjectid(oid, neg=False):
+        raise NotImplementedError()
+
+    @staticmethod
+    def _distinct_req(field, flt):
+        return flt.query(select(field.distinct()).select_from(flt.select_from))
+
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None, **kargs):
+        """This method produces a generator of distinct values for a given
+        field.
+
+        """
+        if isinstance(field, str):
+            n_dots = field.count(".")
+            for i in range(n_dots + 1):
+                subfields = field.rsplit(".", i)
+                try:
+                    fld = self.fields[subfields[0]]
+                except KeyError:
+                    continue
+                for attr in subfields[1:]:
+                    try:
+                        fld = getattr(fld, attr)
+                    except AttributeError:
+                        continue
+                field = fld
+                break
+            else:
+                raise ValueError(f"Unknown field {field!r}")
+        if flt is None:
+            flt = self.flt_empty
+        sort = [
+            (self.fields[key] if isinstance(key, str) else key, way)
+            for key, way in sort or []
+        ]
+        req = self._distinct_req(field, flt, **kargs)
+        for key, way in sort:
+            req = req.order_by(key if way >= 0 else desc(key))
+        if skip is not None:
+            req = req.offset(skip)
+        if limit is not None:
+            req = req.limit(limit)
+        # ``Row.values()`` was deprecated in SQLAlchemy 1.4 and
+        # removed in 2.x; use the ``_mapping`` view instead. Both
+        # major versions accept this form.
+        return (next(iter(res._mapping.values())) for res in self._read_iter(req))
+
+    @staticmethod
+    def _flt_and(cond1, cond2):
+        return cond1 & cond2
+
+    @staticmethod
+    def _flt_or(cond1, cond2):
+        return cond1 | cond2
+
+    @staticmethod
+    def _searchstring_re_inarray(idfield, field, value, neg=False):
+        if isinstance(value, re.Pattern):
+            operator = "~*" if (value.flags & re.IGNORECASE) else "~"
+            value = value.pattern
+            base1 = select(idfield.label("id"), func.unnest(field).label("field")).cte(
+                "base1"
+            )
+            base2 = (
+                select(column("id", Integer))
+                .select_from(base1)
+                .where(column("field").op(operator)(value))
+            )
+            # ``base2`` is the set of row-ids whose array contains
+            # at least one element matching the regex. Positive
+            # selects those ids; negative selects everything else
+            # -- rows whose array has zero matching elements,
+            # plus rows with empty or NULL arrays. Matches the
+            # ``not_(field.any(value)) if neg`` shape on the
+            # scalar-value path below.
+            if neg:
+                return idfield.notin_(base2)
+            return idfield.in_(base2)
+        return not_(field.any(value)) if neg else field.any(value)
+
+    @staticmethod
+    def _searchstring_re(field, value, neg=False):
+        if isinstance(value, re.Pattern):
+            flt = field.op("~*" if (value.flags & re.IGNORECASE) else "~")(
+                value.pattern
+            )
+            if neg:
+                return not_(flt)
+            return flt
+        if neg:
+            return field != value
+        return field == value
+
+    @classmethod
+    def _search_field(cls, field, value, neg=False, map_=None):
+        """Build a positive (``neg=False``) or negative equality
+        clause for a single SQL column given a scalar, list, or
+        compiled regex value. Encapsulates the scalar / list /
+        regex dispatch shared by the various ``searchXXX``
+        helpers on the SQL backends.
+
+        Mirrors :meth:`MongoDB._search_field` so a caller that
+        moves between backends sees the same accept-shape for
+        ``value``. For list values, a single-element list
+        collapses to scalar form (``field == v``) instead of
+        emitting a redundant ``IN ('v')`` -- matching the wire
+        shape Mongo's helper produces.
+
+        ``map_`` is an optional per-element coercion (default
+        ``None`` / identity). Used by ``searchasnum`` to
+        stringify integer AS numbers stored as text in the
+        JSONB-as-text column. ``map_`` and a regex value are
+        mutually exclusive (a compiled pattern has nothing for
+        a per-element coercion to operate on); passing both
+        raises ``TypeError``.
+
+        Declared as ``@classmethod`` so a backend-specific
+        subclass (e.g. a future DuckDB backend) can replace the
+        regex-operator dispatch by overriding
+        ``_searchstring_re`` without touching every caller.
+        """
+        if isinstance(value, re.Pattern):
+            if map_ is not None:
+                raise TypeError(
+                    "_search_field: map_ is incompatible with a regex value"
+                )
+            return cls._searchstring_re(field, value, neg=neg)
+        if not isinstance(value, str) and hasattr(value, "__iter__"):
+            if map_ is not None:
+                value = [map_(elt) for elt in value]
+            else:
+                value = list(value)
+            if len(value) == 1:
+                value = value[0]
+            else:
+                return field.notin_(value) if neg else field.in_(value)
+        elif map_ is not None:
+            value = map_(value)
+        return field != value if neg else field == value
+
+    @classmethod
+    def _searchcert(
+        cls,
+        base,
+        keytype=None,
+        md5=None,
+        sha1=None,
+        sha256=None,
+        subject=None,
+        issuer=None,
+        self_signed=None,
+        pkmd5=None,
+        pksha1=None,
+        pksha256=None,
+    ):
+        req = true()
+        if keytype is not None:
+            req &= base.op("->")("pubkey").op("->>")("type") == keytype
+        for hashtype in ["md5", "sha1", "sha256"]:
+            hashval = locals()[hashtype]
+            if hashval is None:
+                continue
+            key = base.op("->>")(hashtype)
+            if isinstance(hashval, re.Pattern):
+                req &= key.op("~*")(hashval.pattern)
+                continue
+            if isinstance(hashval, list):
+                req &= key.in_([val.lower() for val in hashval])
+                continue
+            req &= key == hashval.lower()
+        if subject is not None:
+            req &= cls._searchstring_re(base.op("->>")("subject_text"), subject)
+        if issuer is not None:
+            req &= cls._searchstring_re(base.op("->>")("issuer_text"), issuer)
+        if self_signed is not None:
+            req &= base.op("->")("self_signed").cast(Boolean) == self_signed
+        for hashtype in ["md5", "sha1", "sha256"]:
+            hashval = locals()[f"pk{hashtype}"]
+            if hashval is None:
+                continue
+            key = base.op("->")("pubkey").op("->>")(hashtype)
+            if isinstance(hashval, re.Pattern):
+                req &= key.op("~*")(hashval.pattern)
+                continue
+            if isinstance(hashval, list):
+                req &= key.in_([val.lower() for val in hashval])
+                continue
+            req &= key == hashval.lower()
+        return req
+
+
+class SQLFlowFilter:
+    """Wraps a parsed :class:`ivre.flow.Query` for the SQL
+    backend.
+
+    :meth:`SQLDBFlow.from_filters` returns one of these so the
+    ``flow.Query`` clauses can be deferred until query time --
+    the translation to a SQLAlchemy ``WHERE`` expression
+    happens inside :meth:`SQLDBFlow.get`, where the
+    ``src`` / ``dst`` :class:`Host` aliases are bound and can
+    be referenced by the ``addr`` / ``src.addr`` / ``dst.addr``
+    shortcuts.
+
+    The wrapper is intentionally small; richer filter-language
+    constructs (``=~`` regex, ``ANY`` / ``ALL`` / ``NONE``
+    array modes, ``LEN`` length mode) are layered on top in
+    follow-up work without changing the public ``from_filters``
+    return-type contract.
+    """
+
+    __slots__ = ("query",)
+
+    def __init__(self, query):
+        self.query = query
+
+    def __repr__(self):
+        return f"SQLFlowFilter(query={self.query!r})"
+
+
+# Translation table from IVRE's filter-language operator
+# tokens to the corresponding SQLAlchemy ``ColumnOperators``
+# magic methods.  ``:`` is the legacy "match" token Mongo
+# treats as ``$eq``; we map it the same way.
+_FLOW_FLT_OPS: dict[str, str] = {
+    ":": "__eq__",
+    "=": "__eq__",
+    "==": "__eq__",
+    "!=": "__ne__",
+    "<": "__lt__",
+    "<=": "__le__",
+    ">": "__gt__",
+    ">=": "__ge__",
+}
+
+
+# Direct column attributes on :class:`Flow` the filter
+# language can reference by their bare name (no ``meta.``
+# prefix, no ``src.`` / ``dst.`` prefix).  ``firstseen`` /
+# ``lastseen`` are split out below because the IVRE web
+# layer ships ISO-8601 strings and we coerce them to
+# :class:`datetime.datetime` before comparison.
+_FLOW_DIRECT_COLS: frozenset[str] = frozenset(
+    {
+        "proto",
+        "dport",
+        "type",
+        "count",
+        "cspkts",
+        "scpkts",
+        "csbytes",
+        "scbytes",
+        "schema_version",
+    }
+)
+
+_FLOW_DATE_COLS: frozenset[str] = frozenset({"firstseen", "lastseen"})
+
+
+class SQLDBFlow(SQLDB, DBFlow):
+    # ``host`` is the per-address endpoint table referenced by
+    # :attr:`Flow.src` / :attr:`Flow.dst`; SQL diverges from
+    # Mongo's inline ``src_addr_0`` / ``src_addr_1`` columns to
+    # let ``host_details`` resolve a node to its incident flows
+    # via an indexed lookup instead of a table scan.  Both
+    # tables are defined in :mod:`ivre.db.sql.tables`.
+    table_layout = namedtuple("flow_layout", ["host", "flow"])
+    tables = table_layout(Host, Flow)
+
+    @staticmethod
+    def query(*args, **kargs):
+        raise NotImplementedError()
+
+    def add_flow(
+        self,
+        labels,
+        keys,
+        counters=None,
+        accumulators=None,
+        srcnode=None,
+        dstnode=None,
+        time=True,
+    ):
+        raise NotImplementedError()
+
+    @classmethod
+    def add_host(cls, labels=None, keys=None, time=True):
+        raise NotImplementedError()
+
+    def add_flow_metadata(
+        self,
+        labels,
+        linktype,
+        keys,
+        flow_keys,
+        counters=None,
+        accumulators=None,
+        time=True,
+        flow_labels=None,
+    ):
+        raise NotImplementedError()
+
+    def add_host_metadata(
+        self,
+        labels,
+        linktype,
+        keys,
+        host_keys=None,
+        counters=None,
+        accumulators=None,
+        time=True,
+    ):
+        raise NotImplementedError()
+
+    def host_details(self, node_id):
+        """Return ``{elt, in_flows, out_flows, clients,
+        servers}`` for the host whose IP address is
+        ``node_id``.
+
+        Mirrors :meth:`MongoDBFlow.host_details`'s contract
+        byte-for-byte:
+
+        * ``elt`` -- ``{addr, firstseen, lastseen}`` where
+          ``firstseen`` / ``lastseen`` are the min / max of
+          the flow timestamps the host participates in.
+        * ``in_flows`` -- list of ``(proto, dport)`` tuples
+          observed on flows where the host is the
+          destination.
+        * ``out_flows`` -- list of ``(proto, dport)`` tuples
+          observed on flows where the host is the source.
+        * ``clients`` -- list of source IPs that talked to
+          the host.
+        * ``servers`` -- list of destination IPs the host
+          talked to.
+
+        Sets are returned as lists for JSON-serialisability
+        (the ``/cgi/flow/host/<addr>`` web endpoint expects
+        the same shape Mongo's helper produces).
+        """
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        # Filter to flows that touch ``node_id`` on either
+        # side.  ``addr`` is a native ``INET`` column so the
+        # printable-IP literal compares directly.
+        where = or_(
+            src_alias.addr == node_id,
+            dst_alias.addr == node_id,
+        )
+        stmt = (
+            select(self.tables.flow, src_alias.addr, dst_alias.addr)
+            .select_from(self._flow_join(src_alias, dst_alias))
+            .where(where)
+        )
+        result = {
+            "elt": {"addr": node_id},
+            "in_flows": set(),
+            "out_flows": set(),
+            "clients": set(),
+            "servers": set(),
+        }
+        firstseen = None
+        lastseen = None
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                rec = self._row2flow(row)
+                if rec["firstseen"] is not None and (
+                    firstseen is None or rec["firstseen"] < firstseen
+                ):
+                    firstseen = rec["firstseen"]
+                if rec["lastseen"] is not None and (
+                    lastseen is None or rec["lastseen"] > lastseen
+                ):
+                    lastseen = rec["lastseen"]
+                if rec["src_addr"] == node_id:
+                    # Host is the source of this flow ->
+                    # outgoing observation; the other side is
+                    # one of the host's "servers".
+                    result["out_flows"].add((rec["proto"], rec["dport"]))
+                    if rec["dst_addr"] is not None:
+                        result["servers"].add(rec["dst_addr"])
+                else:
+                    # Host is the destination of this flow ->
+                    # incoming observation; the source is one
+                    # of the host's "clients".
+                    result["in_flows"].add((rec["proto"], rec["dport"]))
+                    if rec["src_addr"] is not None:
+                        result["clients"].add(rec["src_addr"])
+        result["elt"]["firstseen"] = firstseen
+        result["elt"]["lastseen"] = lastseen
+        # Materialise the sets as lists; the inherited
+        # :class:`DBFlow` consumers (and the web JSON
+        # encoder) rely on the canonical Mongo list shape.
+        result["clients"] = list(result["clients"])
+        result["servers"] = list(result["servers"])
+        result["in_flows"] = list(result["in_flows"])
+        result["out_flows"] = list(result["out_flows"])
+        return result
+
+    def flow_details(self, flow_id):
+        """Return ``{elt[, meta]}`` for the flow with the
+        given ``flow_id`` (the integer ``Flow.id`` primary
+        key).
+
+        Mirrors :meth:`MongoDBFlow.flow_details`: ``elt``
+        carries the flow's "edge" data exactly as
+        :meth:`DBFlow._edge2json_default` produces it (so the
+        web UI can drop the dict straight into its graph
+        edge), with ``firstseen`` / ``lastseen`` echoed at the
+        top level for direct access.  ``meta`` is included
+        only when the flow carries any per-protocol metadata
+        -- the empty-meta case omits the key so callers can
+        ``"meta" in result`` without an emptiness check.
+
+        Returns ``None`` when no flow row matches ``flow_id``;
+        Mongo's helper returns ``None`` in the equivalent
+        ``find_one`` -> ``None`` branch.
+        """
+        try:
+            flow_id_int = int(flow_id)
+        except (TypeError, ValueError):
+            # Mongo accepts ``ObjectId`` strings; the SQL
+            # backend uses an integer PK.  Bad input ->
+            # ``None`` rather than a 500.
+            return None
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        stmt = (
+            select(self.tables.flow, src_alias.addr, dst_alias.addr)
+            .select_from(self._flow_join(src_alias, dst_alias))
+            .where(self.tables.flow.id == flow_id_int)
+        )
+        with self.db.connect() as conn:
+            row = conn.execute(stmt).first()
+        if row is None:
+            return None
+        rec = self._row2flow(row)
+        elt = self._edge2json_default(rec)["data"]
+        # Echo ``firstseen`` / ``lastseen`` at the elt root
+        # the same way :meth:`MongoDBFlow.flow_details`
+        # does -- some callers read them off ``elt`` rather
+        # than ``elt["data"]``.
+        elt["firstseen"] = rec["firstseen"]
+        elt["lastseen"] = rec["lastseen"]
+        result = {"elt": elt}
+        if rec.get("meta"):
+            result["meta"] = rec["meta"]
+        return result
+
+    @classmethod
+    def from_filters(
+        cls,
+        filters,
+        limit=None,
+        skip=0,
+        orderby="",
+        mode=None,
+        timeline=False,
+        after=None,
+        before=None,
+        precision=None,
+    ):
+        """Translate the web-UI / CLI filter dict into a
+        :class:`SQLFlowFilter` carrying the parsed
+        :class:`ivre.flow.Query`.
+
+        Mirrors :meth:`MongoDBFlow.from_filters` (which returns
+        a Mongo filter dict via ``flt_from_query``); the SQL
+        equivalent defers the per-clause SA expression building
+        to :meth:`get`, where the per-query ``Host`` aliases
+        are in scope for the ``addr`` / ``src.addr`` /
+        ``dst.addr`` shortcuts.
+
+        ``after`` / ``before`` / ``precision`` parameters mirror
+        the Mongo signature; they are accepted but ignored by
+        the SQL backend, which has no per-flow ``times`` array
+        (the field is documented as MongoDB-only in
+        :mod:`ivre.flow`).  ``limit`` / ``skip`` / ``orderby`` /
+        ``mode`` / ``timeline`` are accepted for the same
+        signature-compatibility reason and forwarded to the
+        base ``flow.Query`` builder, which itself ignores them.
+        """
+        query = super().from_filters(
+            filters,
+            limit=limit,
+            skip=skip,
+            orderby=orderby,
+            mode=mode,
+            timeline=timeline,
+        )
+        return SQLFlowFilter(query)
+
+    @classmethod
+    def _flow_col_for_attr(cls, attr, src_alias, dst_alias):
+        """Resolve a filter-language attribute path to the
+        SQLAlchemy column it should compare against.
+
+        ``addr`` is special-cased by the caller (it expands to
+        ``src.addr OR dst.addr`` and so cannot be a single
+        column).  ``src.addr`` / ``dst.addr`` resolve to the
+        per-side host alias's ``addr`` column.
+        ``meta.<proto>[.<key>]`` paths route through the
+        ``Flow.meta`` JSONB column via PostgreSQL's
+        ``->`` / ``->>`` accessors.  Plain column names land in
+        :data:`_FLOW_DIRECT_COLS` / :data:`_FLOW_DATE_COLS`.
+
+        Returns ``None`` when the attribute does not match any
+        known column shape; callers turn that into a
+        ``ValueError``.
+        """
+        if attr == "src.addr":
+            return src_alias.addr
+        if attr == "dst.addr":
+            return dst_alias.addr
+        if attr in _FLOW_DIRECT_COLS or attr in _FLOW_DATE_COLS:
+            return getattr(cls.tables.flow, attr)
+        if attr.startswith("meta."):
+            # ``meta.http`` -> ``meta -> 'http'``
+            # ``meta.http.method`` -> ``meta -> 'http' -> 'method'``
+            parts = attr.split(".")[1:]
+            col = cls.tables.flow.meta
+            for part in parts[:-1]:
+                col = col.op("->")(part)
+            # Last hop uses ``->>`` so the result is text and
+            # can be compared with ``=`` to the user's literal.
+            col = col.op("->>")(parts[-1])
+            return col
+        return None
+
+    @classmethod
+    def _coerce_flow_value(cls, attr, value):
+        """Coerce a filter-language literal to the Python type
+        the column expects.  ISO-8601 timestamps in the date
+        columns get parsed via :func:`utils.all2datetime`; all
+        other columns leave the value untouched (the SQLAlchemy
+        ``ColumnOperators`` handle their own coercion against
+        the column type)."""
+        if attr in _FLOW_DATE_COLS and isinstance(value, str):
+            return utils.all2datetime(value)
+        return value
+
+    @classmethod
+    def _flt_from_clause(cls, clause, src_alias, dst_alias):
+        """Translate a single :mod:`ivre.flow` clause into a
+        SQLAlchemy boolean expression.
+
+        Supported shapes:
+        * Simple comparison: ``attr op value``.
+        * Existence check: bare ``attr`` (no operator) ->
+          ``attr IS NOT NULL`` (or ``IS NULL`` under negation).
+        * ``addr op value`` -> ``(src.addr op value) OR
+          (dst.addr op value)``.
+        * Negation prefix (``!``, ``-``, ``~``) wraps the result
+          in :func:`not_`.
+
+        Deferred to follow-up sub-PRs:
+        * ``=~`` regex match.
+        * ``ANY`` / ``ALL`` / ``NONE`` / ``ONE`` array modes.
+        * ``LEN <attr> <op> <n>`` length mode.
+        """
+        if clause.get("array_mode") is not None:
+            raise NotImplementedError(
+                "array-mode filters (ANY/ALL/NONE/ONE) are not yet "
+                "supported on the SQL flow backend"
+            )
+        if clause.get("len_mode"):
+            raise NotImplementedError(
+                "LEN-mode filters are not yet supported on the SQL flow backend"
+            )
+        op_token = clause.get("operator")
+        if op_token == "=~":
+            raise NotImplementedError(
+                "regex filters (=~) are not yet supported on the SQL flow backend"
+            )
+        attr = clause["attr"]
+        neg = bool(clause.get("neg"))
+
+        # Bare attribute without an operator: existence check.
+        if op_token is None:
+            if attr == "addr":
+                expr = or_(src_alias.addr != null(), dst_alias.addr != null())
+            else:
+                col = cls._flow_col_for_attr(attr, src_alias, dst_alias)
+                if col is None:
+                    raise ValueError(f"Unknown flow filter attribute {attr!r}")
+                expr = col != null()
+            return not_(expr) if neg else expr
+
+        sa_op = _FLOW_FLT_OPS.get(op_token)
+        if sa_op is None:
+            raise ValueError(f"Unknown flow filter operator {op_token!r}")
+        value = cls._coerce_flow_value(attr, clause["value"])
+
+        if attr == "addr":
+            # ``addr`` matches either side of the flow.  ``!=``
+            # gets De Morgan'd into ``AND`` of ``!=`` so a host
+            # appearing on either side is correctly excluded.
+            src_expr = getattr(src_alias.addr, sa_op)(value)
+            dst_expr = getattr(dst_alias.addr, sa_op)(value)
+            expr = (
+                and_(src_expr, dst_expr)
+                if op_token == "!="
+                else or_(src_expr, dst_expr)
+            )
+            return not_(expr) if neg else expr
+
+        col = cls._flow_col_for_attr(attr, src_alias, dst_alias)
+        if col is None:
+            raise ValueError(f"Unknown flow filter attribute {attr!r}")
+        expr = getattr(col, sa_op)(value)
+        return not_(expr) if neg else expr
+
+    @classmethod
+    def _flt_from_query(cls, query, src_alias, dst_alias):
+        """Translate a :class:`flow.Query` (an AND of OR
+        groups) into a SQLAlchemy ``WHERE`` expression scoped
+        to the supplied per-side :class:`Host` aliases.
+
+        Returns :func:`true` when the query has no clauses so
+        the caller can plug the result straight into
+        ``select(...).where(...)``.
+        """
+        and_clauses = []
+        for or_group in query.clauses:
+            or_exprs = [cls._flt_from_clause(c, src_alias, dst_alias) for c in or_group]
+            if not or_exprs:
+                continue
+            and_clauses.append(or_exprs[0] if len(or_exprs) == 1 else or_(*or_exprs))
+        if not and_clauses:
+            return true()
+        if len(and_clauses) == 1:
+            return and_clauses[0]
+        return and_(*and_clauses)
+
+    @staticmethod
+    def _orderby_to_sa(orderby, src_alias, dst_alias):
+        """Translate IVRE's ``[(field, direction), ...]``
+        orderby convention into a list of SQLAlchemy
+        ``ColumnElement`` instances suitable for
+        ``select().order_by(*...)``.  ``direction`` is ``1``
+        for ascending or ``-1`` for descending; unknown fields
+        raise ``ValueError`` so a typo at the CLI surfaces
+        eagerly rather than silently sorting by a no-op.
+        """
+        if not orderby:
+            return []
+        out = []
+        for field, direction in orderby:
+            if field == "src.addr":
+                col = src_alias.addr
+            elif field == "dst.addr":
+                col = dst_alias.addr
+            elif field in _FLOW_DIRECT_COLS or field in _FLOW_DATE_COLS:
+                col = getattr(SQLDBFlow.tables.flow, field)
+            else:
+                raise ValueError(f"Unknown flow orderby field {field!r}")
+            out.append(desc(col) if direction == -1 else col)
+        return out
+
+    @staticmethod
+    def _row2flow(row):
+        """Project a JOINed (Flow, src_addr, dst_addr) row into
+        the dict shape :class:`MongoDBFlow.get` returns -- the
+        contract :func:`DBFlow._flow2host` /
+        :func:`DBFlow._edge2json_default` consume.
+
+        ``meta`` round-trips as a Python dict thanks to the
+        ``SQLJSONB`` column; ``sports`` / ``codes`` come out as
+        Python lists thanks to the ``SQLARRAY(Integer)`` column
+        type.
+        """
+        flow_obj, src_addr, dst_addr = row
+        return {
+            "_id": flow_obj.id,
+            "src_addr": str(src_addr) if src_addr is not None else None,
+            "dst_addr": str(dst_addr) if dst_addr is not None else None,
+            "proto": flow_obj.proto,
+            "dport": flow_obj.dport,
+            "type": flow_obj.type,
+            "firstseen": flow_obj.firstseen,
+            "lastseen": flow_obj.lastseen,
+            "cspkts": flow_obj.cspkts,
+            "scpkts": flow_obj.scpkts,
+            "csbytes": flow_obj.csbytes,
+            "scbytes": flow_obj.scbytes,
+            "count": flow_obj.count,
+            "sports": flow_obj.sports,
+            "codes": flow_obj.codes,
+            "meta": flow_obj.meta,
+            "schema_version": flow_obj.schema_version,
+        }
+
+    def get(self, spec, limit=None, skip=None, orderby=None, fields=None):
+        """Iterate flows matching ``spec`` (a :class:`SQLFlowFilter`
+        as returned by :meth:`from_filters`, or ``None`` for the
+        match-all case).  ``spec`` keeps the
+        :meth:`DB.get` parameter name so the inherited
+        :meth:`DBFlow.to_iter` / :meth:`DBFlow.to_graph`
+        helpers (which call ``self.get(flt, ...)``
+        positionally) keep working unchanged.
+
+        Each yielded row is a Mongo-shaped dict (see
+        :meth:`_row2flow`) so the inherited
+        :meth:`DBFlow.to_iter` / :meth:`DBFlow.to_graph` work
+        unchanged on top.
+
+        ``fields`` is accepted for API compatibility with
+        :meth:`DBActive.get` but ignored on the flow path: the
+        whole flow row is cheap to project (no nested array
+        unwinding), and downstream :func:`DBFlow.cursor2json_*`
+        helpers expect every column anyway.
+        """
+        del fields  # unused; signature parity with DBActive.get
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        if spec is None:
+            where = true()
+        elif isinstance(spec, SQLFlowFilter):
+            where = self._flt_from_query(spec.query, src_alias, dst_alias)
+        else:
+            # Allow callers to pass a pre-built SA expression
+            # (used by :meth:`host_details` / :meth:`flow_details`
+            # in follow-up sub-PRs that bypass the parser).
+            where = spec
+        stmt = (
+            select(
+                self.tables.flow,
+                src_alias.addr,
+                dst_alias.addr,
+            )
+            .select_from(
+                join(
+                    self.tables.flow,
+                    src_alias,
+                    self.tables.flow.src == src_alias.id,
+                ).join(dst_alias, self.tables.flow.dst == dst_alias.id)
+            )
+            .where(where)
+        )
+        for col in self._orderby_to_sa(orderby, src_alias, dst_alias):
+            stmt = stmt.order_by(col)
+        if skip:
+            stmt = stmt.offset(skip)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                yield self._row2flow(row)
+
+    def _build_where(self, spec, src_alias, dst_alias):
+        """Return the SQLAlchemy ``WHERE`` expression for a
+        :class:`SQLFlowFilter` / pre-built SA expression /
+        ``None`` (match-all)."""
+        if spec is None:
+            return true()
+        if isinstance(spec, SQLFlowFilter):
+            return self._flt_from_query(spec.query, src_alias, dst_alias)
+        return spec
+
+    def _flow_join(self, src_alias, dst_alias):
+        """Return the canonical
+        ``flow JOIN host AS src_h JOIN host AS dst_h`` join
+        expression.  Pulled out as a tiny helper because every
+        read-side method (``get`` / ``count`` /
+        ``flow_daily`` / ``topvalues``) needs the same join."""
+        return join(
+            self.tables.flow,
+            src_alias,
+            self.tables.flow.src == src_alias.id,
+        ).join(dst_alias, self.tables.flow.dst == dst_alias.id)
+
+    @classmethod
+    def _topvalues_col(cls, field, src_alias, dst_alias):
+        """Resolve a ``topvalues`` field name to the
+        SQLAlchemy expression to GROUP BY / aggregate against.
+
+        Mirrors :meth:`MongoDBFlow.topvalues`'s
+        ``special_fields`` translation table: ``src.addr`` /
+        ``dst.addr`` route through the per-side host alias's
+        ``addr`` column; the rest go through
+        :meth:`_flow_col_for_attr` which already handles
+        direct columns and ``meta.<proto>[.<key>]`` JSONB
+        paths.
+        """
+        if field == "src.addr":
+            return src_alias.addr
+        if field == "dst.addr":
+            return dst_alias.addr
+        col = cls._flow_col_for_attr(field, src_alias, dst_alias)
+        if col is None:
+            raise ValueError(f"Unsupported flow topvalues field {field!r}")
+        return col
+
+    def count(self, flt):
+        """Return ``{"clients": N, "servers": M, "flows": K}``
+        for the matching flows -- mirrors
+        :meth:`MongoDBFlow.count` exactly.
+
+        ``clients`` / ``servers`` are computed as ``COUNT(DISTINCT
+        flow.src)`` / ``COUNT(DISTINCT flow.dst)`` rather than
+        Mongo's two-stage ``$group`` because PostgreSQL handles
+        ``DISTINCT`` aggregation natively (Mongo's pipeline
+        construction was a workaround for ``$count`` only being
+        available in 3.4+).
+        """
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        where = self._build_where(flt, src_alias, dst_alias)
+        stmt = (
+            select(
+                func.count().label("flows"),
+                func.count(self.tables.flow.src.distinct()).label("clients"),
+                func.count(self.tables.flow.dst.distinct()).label("servers"),
+            )
+            .select_from(self._flow_join(src_alias, dst_alias))
+            .where(where)
+        )
+        with self.db.connect() as conn:
+            row = conn.execute(stmt).one()
+        return {
+            "flows": int(row.flows or 0),
+            "clients": int(row.clients or 0),
+            "servers": int(row.servers or 0),
+        }
+
+    @staticmethod
+    def _flow_daily_buckets(rows, precision):
+        """Bucket ``(firstseen, proto, dport, type)`` rows by
+        time-of-day at ``precision`` granularity, accumulating
+        per-bucket ``proto/dport`` histograms.
+
+        Pulled out as a static helper so the bucketing logic
+        can be pin-tested without a live PostgreSQL
+        connection.  Yields the same ``{"flows": [(name,
+        count), ...], "time_in_day": datetime.time}`` dicts
+        :meth:`MongoDBFlow.flow_daily` produces, sorted by
+        time-of-day ascending.
+        """
+        buckets: dict[tuple[int, int, int], dict[str, int]] = {}
+        for row in rows:
+            ts = row.firstseen
+            if ts is None:
+                continue
+            second = ts.second
+            if precision and precision > 0:
+                second = (second // precision) * precision
+            key = (ts.hour, ts.minute, second)
+            if row.proto in ("tcp", "udp") and row.dport is not None:
+                name = f"{row.proto}/{int(row.dport)}"
+            elif row.type is not None:
+                name = f"{row.proto}/{int(row.type)}"
+            else:
+                name = row.proto or ""
+            bucket = buckets.setdefault(key, {})
+            bucket[name] = bucket.get(name, 0) + 1
+        for hour, minute, second in sorted(buckets):
+            yield {
+                "flows": list(buckets[(hour, minute, second)].items()),
+                "time_in_day": datetime.time(hour=hour, minute=minute, second=second),
+            }
+
+    def flow_daily(self, precision, flt, after=None, before=None):
+        """Yield per-time-bucket flow counts for the
+        ``flow daily`` UI / CLI plot.
+
+        Mirrors :meth:`MongoDBFlow.flow_daily`'s output shape:
+        each yielded dict carries ``{"flows": [("proto/dport",
+        count), ...], "time_in_day": datetime.time}``.
+
+        SQL diverges from the Mongo bucketing source -- Mongo
+        unwinds the per-flow ``times`` array (each timeslot is
+        recorded separately on the flow document); the SQL
+        schema has no ``times`` column (it is documented as
+        MongoDB-only in :mod:`ivre.flow`) so we bucket on
+        ``firstseen`` instead.  Each flow contributes once per
+        day (its first-observed timestamp), which under-counts
+        relative to Mongo for long-lived flows but is the most
+        faithful translation the schema supports.
+
+        ``after`` / ``before`` filter on ``firstseen`` (Mongo
+        applies them to ``times.start``); ``precision``
+        bucketing is implemented client-side so the same value
+        the Mongo backend honors works on SQL.
+        """
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        where = self._build_where(flt, src_alias, dst_alias)
+        if after is not None:
+            where = and_(where, self.tables.flow.firstseen >= after)
+        if before is not None:
+            where = and_(where, self.tables.flow.firstseen < before)
+        stmt = (
+            select(
+                self.tables.flow.firstseen,
+                self.tables.flow.proto,
+                self.tables.flow.dport,
+                self.tables.flow.type,
+            )
+            .select_from(self._flow_join(src_alias, dst_alias))
+            .where(where)
+        )
+        with self.db.connect() as conn:
+            yield from self._flow_daily_buckets(conn.execute(stmt), precision)
+
+    def topvalues(
+        self,
+        flt,
+        fields,
+        collect_fields=None,
+        sum_fields=None,
+        limit=None,
+        skip=None,
+        least=False,
+        topnbr=10,
+    ):
+        """Group flows by ``fields`` and yield ``{fields,
+        count, collected}`` dicts -- the contract documented
+        at :meth:`DBFlow.topvalues`.
+
+        ``count`` is ``COUNT(*)`` per group, or ``SUM(<expr>)``
+        when ``sum_fields`` is set (the per-row addition mirrors
+        :meth:`MongoDBFlow.topvalues`'s ``$add`` projection).
+
+        ``collect_fields`` are aggregated per group via
+        ``array_agg(<col>)`` (no SQL-side ``DISTINCT``: each
+        per-collect-field array stays aligned with the others
+        so the per-row tuple can be reconstructed in Python
+        before the final ``set`` deduplication).  Skipping
+        SQL-side ``DISTINCT`` on each column independently is
+        necessary because ``array_agg(DISTINCT col1)`` and
+        ``array_agg(DISTINCT col2)`` would produce arrays of
+        different lengths / orderings that cannot be zipped.
+
+        Limitations vs the Mongo backend (deferred to follow-up
+        sub-PRs):
+
+        * The ``sport`` shortcut (which Mongo unwinds via its
+          ``sports`` array) is not yet supported on SQL.
+        * Direct grouping on ``meta.<proto>[.<key>]`` JSONB
+          paths is not yet supported -- only as ``collect_fields``.
+        """
+        del limit, skip  # legacy aliases; ``topnbr`` is the cap.
+        collect_fields = list(collect_fields) if collect_fields else []
+        sum_fields = list(sum_fields) if sum_fields else []
+        if not fields:
+            raise ValueError("topvalues requires at least one field")
+        src_alias = aliased(Host, name="flow_src_host")
+        dst_alias = aliased(Host, name="flow_dst_host")
+        where = self._build_where(flt, src_alias, dst_alias)
+        group_cols = [self._topvalues_col(f, src_alias, dst_alias) for f in fields]
+        if sum_fields:
+            sum_cols = [
+                self._topvalues_col(f, src_alias, dst_alias) for f in sum_fields
+            ]
+            count_expr = func.sum(sum(sum_cols[1:], sum_cols[0])).label("_count")
+        else:
+            count_expr = func.count().label("_count")
+        collect_exprs = [
+            func.array_agg(self._topvalues_col(f, src_alias, dst_alias)).label(
+                f"_collect_{i}"
+            )
+            for i, f in enumerate(collect_fields)
+        ]
+        stmt = (
+            select(*group_cols, count_expr, *collect_exprs)
+            .select_from(self._flow_join(src_alias, dst_alias))
+            .where(where)
+            .group_by(*group_cols)
+            .order_by(count_expr.asc() if least else count_expr.desc())
+        )
+        if topnbr is not None:
+            stmt = stmt.limit(topnbr)
+        n_fields = len(fields)
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                field_vals = tuple(row[:n_fields])
+                count_val = int(row[n_fields] or 0)
+                if collect_fields:
+                    arrays = [
+                        row[n_fields + 1 + i] or [] for i in range(len(collect_fields))
+                    ]
+                    # Zip per-row across the per-collect-field
+                    # arrays so each element of the resulting
+                    # ``set`` carries one matched tuple of
+                    # ``collect_fields`` values.
+                    collected = set(zip(*arrays))
+                else:
+                    collected = set()
+                yield {
+                    "fields": field_vals,
+                    "count": count_val,
+                    "collected": collected,
+                }
+
+    def top(self, flt, fields, collect=None, sumfields=None):
+        """Alias of :meth:`topvalues` accepting the legacy
+        ``collect`` / ``sumfields`` parameter names from the
+        original abstract :class:`DBFlow.top` shape."""
+        return self.topvalues(flt, fields, collect_fields=collect, sum_fields=sumfields)
+
+    # ------------------------------------------------------------------
+    # Ingestion path -- mirrors :class:`MongoDBFlow`'s bulk-insert API
+    # (``ivre/db/mongo.py:6220``-``:6373``).  Callers (``zeek2db``,
+    # ``flow2db``) treat the bulk handle as opaque, so the SQL backend
+    # represents it as a list of ``(kind, *args)`` tuples that
+    # :meth:`bulk_commit` then dispatches to per-record upserts.
+
+    @staticmethod
+    def start_bulk_insert():
+        """Allocate a fresh bulk-insert buffer.
+
+        Mirrors :meth:`MongoDBFlow.start_bulk_insert`'s contract:
+        callers append entries via :meth:`any2flow` /
+        :meth:`conn2flow` / :meth:`flow2flow` and hand the buffer
+        back to :meth:`bulk_commit`.  The handle is opaque to
+        callers (``zeek2db`` / ``flow2db`` only ever pass it
+        through), so we keep the same in-memory list shape Mongo
+        uses -- the entries are SQL-side ``(kind, *payload)``
+        tuples instead of ``pymongo.UpdateOne`` objects.
+        """
+        utils.LOGGER.debug("start_bulk_insert called")
+        return []
+
+    @classmethod
+    def any2flow(cls, bulk, name, rec):
+        """Queue a non-conn Zeek log record (HTTP, SSH, DNS, ...)
+        for ingestion.
+
+        Mirrors :meth:`MongoDBFlow.any2flow`: defers the actual
+        upsert to :meth:`bulk_commit` so a single SQL transaction
+        covers the whole bulk.  ``name`` is the Zeek log type
+        (``"http"`` / ``"ssh"`` / ...); the per-protocol metadata
+        accumulation it drives in Mongo is deferred to a follow-up
+        sub-PR (the SQL row is created with an empty ``meta``
+        bag).
+        """
+        bulk.append(("any", name, rec))
+
+    @classmethod
+    def conn2flow(cls, bulk, rec):
+        """Queue a Zeek ``conn.log`` record for ingestion.
+
+        Mirrors :meth:`MongoDBFlow.conn2flow`: accumulates packet
+        / byte counters and source-port / ICMP-code sets on the
+        target flow row.
+        """
+        bulk.append(("conn", rec))
+
+    @classmethod
+    def flow2flow(cls, bulk, rec):
+        """Queue a NetFlow / Argus record for ingestion.
+
+        Mirrors :meth:`MongoDBFlow.flow2flow`.  The record shape
+        already carries the ``cspkts`` / ``scpkts`` / ``csbytes``
+        / ``scbytes`` field names ``conn2flow`` derives from
+        Zeek's ``orig_*`` / ``resp_*`` keys, so the SQL upsert
+        path is the same.
+        """
+        bulk.append(("flow", rec))
+
+    def bulk_commit(self, bulk):
+        """Apply every queued ingestion entry inside a single
+        transaction.
+
+        Mirrors :meth:`MongoDBFlow.bulk_commit`'s contract: the
+        bulk is consumed in order, an empty bulk is a no-op, and
+        the method swallows nothing -- the surrounding
+        transaction rolls back on failure so callers see the
+        original exception.
+
+        The SQL implementation issues one ``INSERT ... ON
+        CONFLICT DO UPDATE`` per record (host upsert + flow
+        upsert).  This is per-record chatty compared to Mongo's
+        single ``bulk_write``; bulk-grouping the upserts into a
+        ``COPY`` + ``INSERT ... FROM SELECT`` pipeline (mirroring
+        :meth:`PostgresDBPassive.insert_or_update_bulk`) is a
+        performance follow-up.
+        """
+        if not bulk:
+            return
+        with self.db.begin() as conn:
+            for op in bulk:
+                kind = op[0]
+                if kind == "any":
+                    self._apply_any(conn, op[1], op[2])
+                elif kind == "conn":
+                    self._apply_conn(conn, op[1])
+                elif kind == "flow":
+                    self._apply_flow(conn, op[1])
+                else:  # pragma: no cover -- defensive
+                    raise ValueError(f"Unknown bulk entry kind {kind!r}")
+
+    def _upsert_host(self, conn, addr, firstseen, lastseen):
+        """Upsert a :class:`~ivre.db.sql.tables.Host` row keyed
+        by ``addr`` and return its primary-key ``id``.
+
+        ``firstseen`` / ``lastseen`` collapse via ``LEAST`` /
+        ``GREATEST`` so repeated ingestions of the same host
+        widen the observation window without losing earlier
+        timestamps.  ``addr`` is the natural key (the table
+        carries a ``UNIQUE(addr)`` constraint declared in
+        :mod:`ivre.db.sql.tables`).
+        """
+        host = self.tables.host
+        stmt = postgresql.insert(host).values(
+            addr=addr,
+            firstseen=firstseen,
+            lastseen=lastseen,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[host.addr],
+            set_={
+                "firstseen": func.least(host.firstseen, stmt.excluded.firstseen),
+                "lastseen": func.greatest(host.lastseen, stmt.excluded.lastseen),
+            },
+        ).returning(host.id)
+        return conn.execute(stmt).scalar_one()
+
+    def _flow_upsert_stmt(self, values, increments):
+        """Build the ``INSERT ... ON CONFLICT DO UPDATE``
+        statement that drives every flow upsert.
+
+        ``values`` is the per-record column dict (the row that
+        would be inserted on a fresh key).  ``increments`` is the
+        sub-dict of monotonic counters that must accumulate via
+        ``Flow.<col> + EXCLUDED.<col>`` on conflict (for
+        ``any2flow``: just the timestamps; for ``conn2flow`` /
+        ``flow2flow``: the ``cspkts`` / ``scpkts`` / ``csbytes``
+        / ``scbytes`` / ``count`` block plus optional
+        ``sports`` / ``codes`` array merges).
+
+        The conflict target is the partial unique index
+        :data:`flow_unique_lookup` (declared in
+        :mod:`ivre.db.sql.tables`); the ``COALESCE(<col>, -1)``
+        wrappers must match the index's expressions exactly so
+        PostgreSQL infers the right index.
+        """
+        flow_t = self.tables.flow
+        stmt = postgresql.insert(flow_t).values(values)
+        excluded = stmt.excluded
+        # The upsert SET list always widens the observation
+        # window via LEAST/GREATEST and accumulates the counter
+        # block via SUM.  ``coalesce(col, 0)`` guards against
+        # earlier ``any2flow`` rows that left the counters NULL;
+        # NULL + anything = NULL would otherwise drop the
+        # accumulated value.
+        upsert = {
+            "firstseen": func.least(flow_t.firstseen, excluded.firstseen),
+            "lastseen": func.greatest(flow_t.lastseen, excluded.lastseen),
+        }
+        for col_name, default in increments.items():
+            col = getattr(flow_t, col_name)
+            upsert[col_name] = func.coalesce(col, default) + getattr(excluded, col_name)
+        # ``sports`` / ``codes`` accumulate via array
+        # concatenation (no dedup, mirroring the ON CONFLICT
+        # contract -- Mongo's ``$addToSet`` produces unique
+        # elements; SQL keeps duplicates for now and the
+        # downstream queries don't enumerate the lists, only
+        # their length / ANY-membership).  ``COALESCE`` again
+        # tolerates NULL on either side.
+        empty_int = postgresql.array([], type_=Integer)
+        for arr_col in ("sports", "codes"):
+            arr = getattr(flow_t, arr_col)
+            exc_arr = getattr(excluded, arr_col)
+            upsert[arr_col] = func.array_cat(
+                func.coalesce(arr, empty_int),
+                func.coalesce(exc_arr, empty_int),
+            )
+        return stmt.on_conflict_do_update(
+            index_elements=[
+                "src",
+                "dst",
+                "proto",
+                func.coalesce(column("dport"), -1),
+                func.coalesce(column("type"), -1),
+                "schema_version",
+            ],
+            set_=upsert,
+        )
+
+    def _flow_merge(self, conn, values, increments):
+        """Apply a single flow upsert via the PG ``ON CONFLICT``
+        path.
+
+        Indirection point so backends without expression-index
+        ``ON CONFLICT`` inference (notably DuckDB, which raises
+        ``Not implemented Error: Non-column index element not
+        supported yet!``) can override with a SELECT-then-merge
+        strategy without touching the per-record ``_apply_*``
+        helpers.  PostgreSQL keeps the single-statement upsert
+        path :meth:`_flow_upsert_stmt` builds.
+        """
+        conn.execute(self._flow_upsert_stmt(values, increments))
+
+    @staticmethod
+    def _flow_key_columns(rec):
+        """Return the ``proto`` / ``dport`` / ``type`` triple
+        used by the upsert lookup key.
+
+        Mirrors :meth:`MongoDBFlow._get_flow_key`'s dispatch
+        (``ivre/db/mongo.py:6242``): ``dport`` is set for
+        TCP / UDP, ``type`` for ICMP, both NULL otherwise (the
+        unique index folds NULLs to ``-1`` via ``COALESCE`` so
+        every protocol shares the same constraint).
+        """
+        proto = rec["proto"]
+        dport = rec["dport"] if proto in ("tcp", "udp") else None
+        type_ = rec.get("type") if proto == "icmp" else None
+        return proto, dport, type_
+
+    def _apply_any(self, conn, name, rec):
+        """Upsert the flow row backing a non-conn Zeek log entry.
+
+        Per :meth:`MongoDBFlow.any2flow`'s contract the top-level
+        ``count`` is *not* incremented (only ``meta.<name>.count``
+        is, which the SQL backend defers); ``cspkts`` / ``scpkts``
+        / ``csbytes`` / ``scbytes`` are likewise left at zero.
+        Only ``firstseen`` / ``lastseen`` widen.
+        """
+        # ``name`` is reserved for the upcoming ``meta.<name>``
+        # accumulation; recorded via debug log so a stray call
+        # before that follow-up lands surfaces in IVRE_DEBUG=1
+        # runs.
+        del name
+        proto, dport, type_ = self._flow_key_columns(rec)
+        src_id = self._upsert_host(conn, rec["src"], rec["start_time"], rec["end_time"])
+        dst_id = self._upsert_host(conn, rec["dst"], rec["start_time"], rec["end_time"])
+        values = {
+            "src": src_id,
+            "dst": dst_id,
+            "proto": proto,
+            "dport": dport,
+            "type": type_,
+            "firstseen": rec["start_time"],
+            "lastseen": rec["end_time"],
+            "cspkts": 0,
+            "scpkts": 0,
+            "csbytes": 0,
+            "scbytes": 0,
+            "count": 0,
+            "sports": None,
+            "codes": None,
+            "meta": {},
+            "schema_version": ivre_flow.SCHEMA_VERSION,
+        }
+        # ``any2flow`` does not bump any counter on conflict --
+        # the ``meta.<name>.count`` accumulation Mongo drives
+        # belongs to the deferred ``meta`` follow-up.  Pass an
+        # empty ``increments`` so :meth:`_flow_merge` only
+        # widens the timestamp window.
+        self._flow_merge(conn, values, increments={})
+
+    def _apply_conn(self, conn, rec):
+        """Upsert the flow row backing a Zeek ``conn.log``
+        entry.
+
+        Mirrors :meth:`MongoDBFlow.conn2flow`'s ``$inc`` /
+        ``$addToSet`` blocks (``ivre/db/mongo.py:6311``).
+        """
+        proto, dport, type_ = self._flow_key_columns(rec)
+        src_id = self._upsert_host(conn, rec["src"], rec["start_time"], rec["end_time"])
+        dst_id = self._upsert_host(conn, rec["dst"], rec["start_time"], rec["end_time"])
+        sports = (
+            [rec["sport"]]
+            if proto in ("tcp", "udp") and rec.get("sport") is not None
+            else None
+        )
+        codes = (
+            [rec["code"]] if proto == "icmp" and rec.get("code") is not None else None
+        )
+        values = {
+            "src": src_id,
+            "dst": dst_id,
+            "proto": proto,
+            "dport": dport,
+            "type": type_,
+            "firstseen": rec["start_time"],
+            "lastseen": rec["end_time"],
+            "cspkts": rec.get("orig_pkts", 0) or 0,
+            "scpkts": rec.get("resp_pkts", 0) or 0,
+            "csbytes": rec.get("orig_ip_bytes", 0) or 0,
+            "scbytes": rec.get("resp_ip_bytes", 0) or 0,
+            "count": 1,
+            "sports": sports,
+            "codes": codes,
+            "meta": {},
+            "schema_version": ivre_flow.SCHEMA_VERSION,
+        }
+        self._flow_merge(
+            conn,
+            values,
+            increments={
+                "cspkts": 0,
+                "scpkts": 0,
+                "csbytes": 0,
+                "scbytes": 0,
+                "count": 0,
+            },
+        )
+
+    def _apply_flow(self, conn, rec):
+        """Upsert the flow row backing a NetFlow / Argus entry.
+
+        Mirrors :meth:`MongoDBFlow.flow2flow`: identical to
+        :meth:`_apply_conn` except the counter field names are
+        already ``cspkts`` / ``scpkts`` / ``csbytes`` /
+        ``scbytes`` on the input record (no ``orig_*`` /
+        ``resp_*`` translation).
+        """
+        proto, dport, type_ = self._flow_key_columns(rec)
+        src_id = self._upsert_host(conn, rec["src"], rec["start_time"], rec["end_time"])
+        dst_id = self._upsert_host(conn, rec["dst"], rec["start_time"], rec["end_time"])
+        sports = (
+            [rec["sport"]]
+            if proto in ("tcp", "udp") and rec.get("sport") is not None
+            else None
+        )
+        codes = (
+            [rec["code"]] if proto == "icmp" and rec.get("code") is not None else None
+        )
+        values = {
+            "src": src_id,
+            "dst": dst_id,
+            "proto": proto,
+            "dport": dport,
+            "type": type_,
+            "firstseen": rec["start_time"],
+            "lastseen": rec["end_time"],
+            "cspkts": rec.get("cspkts", 0) or 0,
+            "scpkts": rec.get("scpkts", 0) or 0,
+            "csbytes": rec.get("csbytes", 0) or 0,
+            "scbytes": rec.get("scbytes", 0) or 0,
+            "count": 1,
+            "sports": sports,
+            "codes": codes,
+            "meta": {},
+            "schema_version": ivre_flow.SCHEMA_VERSION,
+        }
+        self._flow_merge(
+            conn,
+            values,
+            increments={
+                "cspkts": 0,
+                "scpkts": 0,
+                "csbytes": 0,
+                "scbytes": 0,
+                "count": 0,
+            },
+        )
+
+    def cleanup_flows(self):
+        """Heuristic that reverses flows whose source /
+        destination addresses appear swapped.
+
+        :meth:`MongoDBFlow.cleanup_flows` rebuilds the ``sports``
+        distribution per (src, dst, proto, sport) tuple and
+        reverses flows that look like the result of a swap (more
+        than five distinct destination ports observed for a
+        single source port, with TCP segments large enough to
+        rule out a port scan).  Porting that aggregation
+        pipeline -- with its ``$unwind`` / ``$group`` /
+        ``$addToSet`` chain -- to SQL would require an extra
+        per-bulk pass over the ``flow`` table; we leave it as a
+        follow-up sub-PR and ship a no-op so ``zeek2db`` runs
+        end-to-end without raising.
+        """
+        utils.LOGGER.debug(
+            "cleanup_flows is a no-op on the SQL backend "
+            "(host-swap heuristic deferred)"
+        )
+
+
+class Filter:
+    @staticmethod
+    def fltand(flt1, flt2):
+        return flt1 if flt2 is None else flt2 if flt1 is None else and_(flt1, flt2)
+
+    @staticmethod
+    def fltor(flt1, flt2):
+        return flt1 if flt2 is None else flt2 if flt1 is None else or_(flt1, flt2)
+
+
+class ActiveFilter(Filter):
+    def __init__(
+        self,
+        main=None,
+        hostname=None,
+        category=None,
+        port=None,
+        script=None,
+        tables=None,
+        tag=None,
+        trace=None,
+        text=None,
+    ):
+        self.main = main
+        self.hostname = [] if hostname is None else hostname
+        self.category = [] if category is None else category
+        self.port = [] if port is None else port
+        self.script = [] if script is None else script
+        self.tables = tables  # default value is handled in the subclasses
+        self.tag = [] if tag is None else tag
+        self.trace = [] if trace is None else trace
+        # ``text`` holds ``[(incl, search_term), ...]`` for
+        # full-text searches via :meth:`SQLDBActive.searchtext`.
+        # Each search term is matched against every text-bearing
+        # column in the schema (see
+        # :attr:`SQLDBActive._TEXT_SEARCH_TABLES`); a single
+        # ``searchtext("foo")`` therefore composes an
+        # OR-of-EXISTS across every relevant child table.
+        self.text = [] if text is None else text
+
+    @property
+    def all_queries(self):
+        return {
+            "main": self.main,
+            "hostname": self.hostname,
+            "category": self.category,
+            "port": [elt[1] if elt[0] else not_(elt[1]) for elt in self.port],
+            "script": self.script,
+            "tables": self.tables,
+            "tag": self.tag,
+            "trace": self.trace,
+            "text": self.text,
+        }
+
+    def copy(self):
+        return self.__class__(
+            main=self.main,
+            hostname=self.hostname[:],
+            category=self.category[:],
+            port=self.port[:],
+            script=self.script[:],
+            tables=self.tables,
+            tag=self.tag[:],
+            trace=self.trace[:],
+            text=self.text[:],
+        )
+
+    def __and__(self, other):
+        if self.tables != other.tables:
+            raise ValueError(
+                f"Cannot 'AND' two filters on separate tables ({self.tables} / {other.tables})"
+            )
+        return self.__class__(
+            main=self.fltand(self.main, other.main),
+            hostname=self.hostname + other.hostname,
+            category=self.category + other.category,
+            port=self.port + other.port,
+            script=self.script + other.script,
+            tables=self.tables,
+            tag=self.tag + other.tag,
+            trace=self.trace + other.trace,
+            text=self.text + other.text,
+        )
+
+    def __or__(self, other):
+        # FIXME: this has to be implemented
+        if self.hostname and other.hostname:
+            raise ValueError("Cannot 'OR' two filters on hostname")
+        if self.category and other.category:
+            raise ValueError("Cannot 'OR' two filters on category")
+        if self.port and other.port:
+            raise ValueError("Cannot 'OR' two filters on port")
+        if self.script and other.script:
+            raise ValueError("Cannot 'OR' two filters on script")
+        if self.tag and other.tag:
+            raise ValueError("Cannot 'OR' two filters on tag")
+        if self.trace and other.trace:
+            raise ValueError("Cannot 'OR' two filters on trace")
+        if self.text and other.text:
+            raise ValueError("Cannot 'OR' two filters on text")
+        if self.tables != other.tables:
+            raise ValueError("Cannot 'OR' two filters on separate tables")
+        return self.__class__(
+            main=self.fltor(self.main, other.main),
+            hostname=self.hostname + other.hostname,
+            category=self.category + other.category,
+            port=self.port + other.port,
+            script=self.script + other.script,
+            tables=self.tables,
+            trace=self.trace + other.trace,
+            text=self.text + other.text,
+        )
+
+    def select_from_base(self, base=None):
+        if base in [None, self.tables.scan, self.tables.scan.__mapper__]:
+            base = self.tables.scan
+        else:
+            base = join(self.tables.scan, base)
+        return base
+
+    @property
+    def select_from(self):
+        return self.select_from_base()
+
+    def query(self, req):
+        if self.main is not None:
+            req = req.where(self.main)
+        for incl, subflt in self.hostname:
+            base = select(self.tables.hostname.scan).where(subflt)
+            if incl:
+                req = req.where(self.tables.scan.id.in_(base))
+            else:
+                req = req.where(self.tables.scan.id.notin_(base))
+        # See <http://stackoverflow.com/q/17112345/3223422> - "Using
+        # INTERSECT with tables from a WITH clause"
+        for subflt in self.category:
+            req = req.where(
+                exists(
+                    select(1)
+                    .select_from(
+                        join(
+                            self.tables.category, self.tables.association_scan_category
+                        )
+                    )
+                    .where(subflt)
+                    .where(
+                        self.tables.association_scan_category.scan
+                        == self.tables.scan.id
+                    )
+                )
+            )
+        for incl, subflt in self.port:
+            if incl:
+                req = req.where(
+                    exists(
+                        select(1)
+                        .select_from(self.tables.port)
+                        .where(subflt)
+                        .where(self.tables.port.scan == self.tables.scan.id)
+                    )
+                )
+            else:
+                base = select(self.tables.port.scan).where(subflt)
+                req = req.where(self.tables.scan.id.notin_(base))
+        for incl, subflt in self.script:
+            subreq = select(1).select_from(join(self.tables.script, self.tables.port))
+            if isinstance(subflt, tuple):
+                for selectfrom in subflt[1]:
+                    subreq = subreq.select_from(selectfrom)
+                subreq = subreq.where(subflt[0])
+            else:
+                subreq = subreq.where(subflt)
+            subreq = subreq.where(self.tables.port.scan == self.tables.scan.id)
+            if incl:
+                req = req.where(exists(subreq))
+            else:
+                req = req.where(not_(exists(subreq)))
+        for incl, subflt in self.tag:
+            base = select(self.tables.tag.scan).where(subflt)
+            if incl:
+                req = req.where(self.tables.scan.id.in_(base))
+            else:
+                req = req.where(self.tables.scan.id.notin_(base))
+        for subflt in self.trace:
+            req = req.where(
+                exists(
+                    select(1)
+                    .select_from(join(self.tables.trace, self.tables.hop))
+                    .where(subflt)
+                    .where(self.tables.trace.scan == self.tables.scan.id)
+                )
+            )
+        for incl, term in self.text:
+            req = req.where(
+                self._text_predicate(term) if incl else not_(self._text_predicate(term))
+            )
+        return req
+
+    # ``text`` filter helpers
+    # ----------------------
+    # ``searchtext`` walks every text-bearing child table in
+    # the active schema and OR-joins per-table predicates of
+    # the form ``EXISTS (SELECT 1 FROM child WHERE
+    # child.scan = scan.id AND <fts-expr> @@ plainto_tsquery(?))``.
+    # The per-table column lists below are the SQL projection
+    # of :attr:`DBActive.text_fields` (the MongoDB-style
+    # dot-paths declared in :mod:`ivre.db`).
+    #
+    # Each per-table predicate composes a *single*
+    # ``to_tsvector('english',
+    # coalesce(col1, '') || ' ' || coalesce(col2, '') || ...)``
+    # expression rather than ``OR``-ing per-column
+    # ``to_tsvector`` calls.  PostgreSQL can match the
+    # concatenated expression against a *single* GIN index
+    # built over the same expression (see
+    # :func:`_fts_index` in :mod:`ivre.db.sql.tables`); a
+    # per-column variant would need one GIN index per column
+    # and the query planner cannot merge them as efficiently.
+    _TEXT_SEARCH_PORT_COLUMNS = (
+        "service_name",
+        "service_product",
+        "service_version",
+        "service_extrainfo",
+        "service_devicetype",
+        "service_hostname",
+        "service_ostype",
+    )
+    _TEXT_SEARCH_HOSTNAME_COLUMNS = ("name",)
+    _TEXT_SEARCH_TAG_COLUMNS = ("value", "info")
+    _TEXT_SEARCH_HOP_COLUMNS = ("host",)
+    _TEXT_SEARCH_SCRIPT_COLUMNS = ("output",)
+    _TEXT_SEARCH_CATEGORY_COLUMNS = ("name",)
+
+    @staticmethod
+    def _fts_concat(table, column_names):
+        """Build the
+        ``to_tsvector('english', coalesce(<table>.<col1>, '') || ' ' || ...)``
+        expression that both :meth:`_text_predicate` and the GIN
+        indexes declared in :mod:`ivre.db.sql.tables` (via
+        :func:`ivre.db.sql.tables._fts_index`) reference.
+
+        Returns a SQLAlchemy ``literal_column`` clause built
+        from the same string template :func:`tables._fts_concat`
+        uses; the byte-for-byte match is required so
+        PostgreSQL's planner can substitute the GIN index for
+        the ``WHERE ... @@ ...`` clause.  A SA-expression form
+        (``func.to_tsvector("english", func.coalesce(col, "")
+        + " " + ...)``) emits the same SQL textually but
+        binds ``'english'`` as a parameter rather than a
+        literal regconfig, which the planner treats as a
+        non-immutable function and therefore refuses to match
+        against the index expression.
+        """
+        return tables_module._fts_concat(table.__tablename__, column_names)
+
+    def _text_predicate(self, term):
+        """Build the SQL filter for one ``searchtext(<term>)``
+        match.  Returns an ``OR`` of per-table ``EXISTS``
+        predicates; each per-table predicate is a single
+        ``to_tsvector(...) @@ plainto_tsquery(...)`` over the
+        concatenation of that table's text columns (see
+        :meth:`_fts_concat`).
+
+        The query relies on PostgreSQL's text-search operators;
+        on DuckDB the same operators are accepted via the
+        ``duckdb-engine`` PG-derived dialect but require the
+        ``fts`` extension to be loaded (delivered by a future
+        sub-PR alongside ``PRAGMA create_fts_index`` over the
+        same column set).
+        """
+        tsq = func.plainto_tsquery("english", term)
+        clauses = []
+        # Direct child of ``scan``: hostname, tag, port.
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(self.tables.hostname)
+                .where(self.tables.hostname.scan == self.tables.scan.id)
+                .where(
+                    self._fts_concat(
+                        self.tables.hostname, self._TEXT_SEARCH_HOSTNAME_COLUMNS
+                    ).op("@@")(tsq)
+                )
+            )
+        )
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(self.tables.tag)
+                .where(self.tables.tag.scan == self.tables.scan.id)
+                .where(
+                    self._fts_concat(self.tables.tag, self._TEXT_SEARCH_TAG_COLUMNS).op(
+                        "@@"
+                    )(tsq)
+                )
+            )
+        )
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(self.tables.port)
+                .where(self.tables.port.scan == self.tables.scan.id)
+                .where(
+                    self._fts_concat(
+                        self.tables.port, self._TEXT_SEARCH_PORT_COLUMNS
+                    ).op("@@")(tsq)
+                )
+            )
+        )
+        # Two-hop child of ``scan``: ``script`` -> ``port`` ->
+        # ``scan``.
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(join(self.tables.script, self.tables.port))
+                .where(self.tables.port.scan == self.tables.scan.id)
+                .where(
+                    self._fts_concat(
+                        self.tables.script, self._TEXT_SEARCH_SCRIPT_COLUMNS
+                    ).op("@@")(tsq)
+                )
+            )
+        )
+        # Two-hop child of ``scan``: ``hop`` -> ``trace`` ->
+        # ``scan``.
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(join(self.tables.trace, self.tables.hop))
+                .where(self.tables.trace.scan == self.tables.scan.id)
+                .where(
+                    self._fts_concat(self.tables.hop, self._TEXT_SEARCH_HOP_COLUMNS).op(
+                        "@@"
+                    )(tsq)
+                )
+            )
+        )
+        # Two-hop child of ``scan``: ``category`` ->
+        # ``association_scan_category`` -> ``scan``.
+        clauses.append(
+            exists(
+                select(1)
+                .select_from(
+                    join(
+                        self.tables.category,
+                        self.tables.association_scan_category,
+                    )
+                )
+                .where(
+                    self.tables.association_scan_category.scan == self.tables.scan.id
+                )
+                .where(
+                    self._fts_concat(
+                        self.tables.category, self._TEXT_SEARCH_CATEGORY_COLUMNS
+                    ).op("@@")(tsq)
+                )
+            )
+        )
+        return or_(*clauses)
+
+
+class NmapFilter(ActiveFilter):
+    def __init__(
+        self,
+        main=None,
+        hostname=None,
+        category=None,
+        port=None,
+        script=None,
+        tables=None,
+        tag=None,
+        trace=None,
+        text=None,
+    ):
+        super().__init__(
+            main=main,
+            hostname=hostname,
+            category=category,
+            port=port,
+            script=script,
+            tables=SQLDBNmap.tables if tables is None else tables,
+            tag=tag,
+            trace=trace,
+            text=text,
+        )
+
+
+class ViewFilter(ActiveFilter):
+    def __init__(
+        self,
+        main=None,
+        hostname=None,
+        category=None,
+        port=None,
+        script=None,
+        tables=None,
+        tag=None,
+        trace=None,
+        text=None,
+    ):
+        super().__init__(
+            main=main,
+            hostname=hostname,
+            category=category,
+            port=port,
+            script=script,
+            tables=SQLDBView.tables if tables is None else tables,
+            tag=tag,
+            trace=trace,
+            text=text,
+        )
+
+
+class SQLDBActive(SQLDB, DBActive):
+    _needunwind_script = set(
+        [
+            "http-headers",
+            "http-user-agent",
+            "ssh-hostkey",
+            "ssl-cert",
+            "ssl-ja3-client",
+            "ssl-ja3-server",
+        ]
+    )
+
+    @classmethod
+    def needunwind_script(cls, key):
+        key = key.split(".")
+        for i in range(len(key)):
+            subkey = ".".join(key[: i + 1])
+            if subkey in cls._needunwind_script:
+                yield subkey
+
+    def __init__(self, url):
+        super().__init__(url)
+        self.output_function = None
+        self.bulk = None
+
+    def store_host(self, host):
+        raise NotImplementedError()
+
+    def store_or_merge_host(self, host):
+        raise NotImplementedError()
+
+    def migrate_schema(self, version):
+        """Migrates the scan data."""
+        failed = 0
+        if (version or 0) < 9:
+            failed += self._migrate_schema_8_9()
+        if (version or 0) < 10:
+            failed += self._migrate_schema_9_10()
+        if (version or 0) < 11:
+            failed += self._migrate_schema_10_11()
+        if (version or 0) < 12:
+            failed += self._migrate_schema_11_12()
+        if (version or 0) < 13:
+            failed += self._migrate_schema_12_13()
+        if (version or 0) < 14:
+            failed += self._migrate_schema_13_14()
+        if (version or 0) < 15:
+            failed += self._migrate_schema_14_15()
+        if (version or 0) < 16:
+            failed += self._migrate_schema_15_16()
+        if (version or 0) < 18:
+            failed += self._migrate_schema_17_18()
+        if (version or 0) < 19:
+            failed += self._migrate_schema_18_19()
+        return failed
+
+    def _migrate_schema_8_9(self):
+        """Converts records from version 8 to version 9. Version 9 creates a
+        structured output for http-headers script.
+
+        """
+        cond = self.tables.scan.schema_version == 8
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "http-headers"))
+        )
+        for rec in self._read_iter(req):
+            if "http-headers" not in rec.data:
+                try:
+                    data = xmlnmap.add_http_headers_data(
+                        {"id": "http-headers", "output": rec.output}
+                    )
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == "http-headers",
+                                )
+                            )
+                            .values(data={"http-headers": data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=9))
+        return len(failed)
+
+    def _migrate_schema_9_10(self):
+        """Converts a record from version 9 to version 10. Version 10 changes
+        the field names of the structured output for s7-info script.
+
+        """
+        cond = self.tables.scan.schema_version == 9
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "s7-info"))
+        )
+        for rec in self._read_iter(req):
+            if "s7-info" in rec.data:
+                try:
+                    data = xmlnmap.change_s7_info_keys(rec.data["s7-info"])
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == "s7-info",
+                                )
+                            )
+                            .values(data={"s7-info": data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=10))
+        return len(failed)
+
+    def _migrate_schema_10_11(self):
+        """Converts a record from version 10 to version 11. Version 11 changes
+        the way IP addresses are stored.
+
+        """
+        raise NotImplementedError
+
+    def _migrate_schema_11_12(self):
+        """Converts a record from version 11 to version 12. Version 12 changes
+        the structured output for fcrdns and rpcinfo script.
+
+        """
+        cond = self.tables.scan.schema_version == 11
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name.in_(["fcrdns", "rpcinfo"])))
+        )
+        for rec in self._read_iter(req):
+            if rec.name in rec.data:
+                migr_func = {
+                    "fcrdns": xmlnmap.change_fcrdns_migrate,
+                    "rpcinfo": xmlnmap.change_rpcinfo,
+                }[rec.name]
+                try:
+                    data = migr_func(rec.data[rec.name])
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(data={rec.name: data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=12))
+        return len(failed)
+
+    def _migrate_schema_12_13(self):
+        """Converts a record from version 12 to version 13. Version 13 changes
+        the structured output for ms-sql-info and smq-enum-shares scripts.
+
+        """
+        cond = self.tables.scan.schema_version == 12
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(
+                and_(
+                    cond,
+                    self.tables.script.name.in_(["ms-sql-info", "smb-enum-shares"]),
+                )
+            )
+        )
+        for rec in self._read_iter(req):
+            if rec.name in rec.data:
+                migr_func = {
+                    "ms-sql-info": xmlnmap.change_ms_sql_info,
+                    "smb-enum-shares": xmlnmap.change_smb_enum_shares,
+                }[rec.name]
+                try:
+                    data = migr_func(rec.data[rec.name])
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(data={rec.name: data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=13))
+        return len(failed)
+
+    def _migrate_schema_13_14(self):
+        """Converts a record from version 13 to version 14. Version 14 changes
+        the structured output for ssh-hostkey and ls scripts to prevent a same
+        field from having different data types.
+
+        """
+        cond = self.tables.scan.schema_version == 13
+        failed = set()
+        scripts = [
+            script_name
+            for script_name, alias in ALIASES_TABLE_ELEMS.items()
+            if alias == "ls"
+        ]
+        scripts.append("ssh-hostkey")
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name.in_(scripts)))
+        )
+        for rec in self._read_iter(req):
+            if rec.name in rec.data:
+                migr_func = (
+                    xmlnmap.change_ssh_hostkey
+                    if rec.name == "ssh-hostkey"
+                    else xmlnmap.change_ls_migrate
+                )
+                try:
+                    data = migr_func(rec.data[rec.name])
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(data={rec.name: data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=14))
+        return len(failed)
+
+    def _migrate_schema_14_15(self):
+        """Converts a record from version 14 to version 15. Version 15 changes
+        the structured output for httpègit script to move data to values
+        instead of keys.
+
+        """
+        cond = self.tables.scan.schema_version == 14
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "http-git"))
+        )
+        for rec in self._read_iter(req):
+            if rec.name in rec.data:
+                try:
+                    data = xmlnmap.change_http_git(rec.data[rec.name])
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(data={rec.name: data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=15))
+        return len(failed)
+
+    def _migrate_schema_15_16(self):
+        """Converts a record from version 15 to version 16. Version 16 uses a
+        consistent structured output for Nmap http-server-header script (old
+        versions reported `{"Server": "value"}`, while recent versions report
+        `["value"]`).
+
+        """
+        cond = self.tables.scan.schema_version == 15
+        failed = []
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "http-server-header"))
+        )
+        for rec in self._read_iter(req):
+            updated = False
+            if "http-server-header" in rec.data:
+                data = rec.data["http-server-header"]
+                if isinstance(data, dict):
+                    updated = True
+                    if "Server" in data:
+                        data = [data["Server"]]
+                    else:
+                        data = []
+            else:
+                try:
+                    data = [
+                        line.split(":", 1)[1].lstrip()
+                        for line in (line.strip() for line in rec.output.splitlines())
+                        if line.startswith("Server:")
+                    ]
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    updated = True
+            if updated:
+                self._write(
+                    update(self.tables.script)
+                    .where(
+                        and_(
+                            self.tables.script.port == rec.port,
+                            self.tables.script.name == "http-server-header",
+                        )
+                    )
+                    .values(data={"http-server-header": data})
+                )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=16))
+        return len(failed)
+
+    def _migrate_schema_17_18(self):
+        """Converts a record from version 17 to version 18. Version 18
+        introduces HASSH (SSH fingerprint) in ssh2-enum-algos.
+
+        """
+        cond = self.tables.scan.schema_version == 17
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "ssh2-enum-algos"))
+        )
+        for rec in self._read_iter(req):
+            if rec.name in rec.data:
+                try:
+                    output, data = xmlnmap.change_ssh2_enum_algos(
+                        rec.output,
+                        rec.data[rec.name],
+                    )
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %r", rec.id, exc_info=True
+                    )
+                    failed.add(rec.id)
+                else:
+                    if data:
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(output=output, data={rec.name: data})
+                        )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=18))
+        return len(failed)
+
+    def _migrate_schema_18_19(self):
+        """Converts a record from version 18 to version 19. Version 19
+        splits smb-os-discovery scripts into two, a ntlm-info one that contains all
+        the information the original smb-os-discovery script got from NTLM, and a
+        smb-os-discovery script with only the information regarding SMB
+
+        """
+        cond = self.tables.scan.schema_version == 18
+        failed = set()
+        req = (
+            select(
+                self.tables.scan.id,
+                self.tables.script.name,
+                self.tables.script.port,
+                self.tables.script.output,
+                self.tables.script.data,
+            )
+            .select_from(
+                join(join(self.tables.scan, self.tables.port), self.tables.script)
+            )
+            .where(and_(cond, self.tables.script.name == "smb-os-discovery"))
+        )
+        for rec in self._read_iter(req):
+            if rec.name == "smb-os-discovery":
+                if rec.name in rec.data:
+                    try:
+                        smb, ntlm = xmlnmap.split_smb_os_discovery(rec.data)
+                    except Exception:
+                        utils.LOGGER.warning(
+                            "Cannot migrate host %r", rec.id, exc_info=True
+                        )
+                        failed.add(rec.id)
+                    else:
+                        if "masscan" in smb:
+                            data = {
+                                "smb-os-discovery": smb["smb-os-discovery"],
+                                "masscan": smb["masscan"],
+                            }
+                        else:
+                            data = {"smb-os-discovery": smb["smb-os-discovery"]}
+                        self._write(
+                            update(self.tables.script)
+                            .where(
+                                and_(
+                                    self.tables.script.port == rec.port,
+                                    self.tables.script.name == rec.name,
+                                )
+                            )
+                            .values(output=smb["output"], data=data)
+                        )
+                        self._write(
+                            insert(self.tables.script).values(
+                                port=rec.port,
+                                name=ntlm["id"],
+                                output=ntlm["output"],
+                                data={"ntlm-info": ntlm["ntlm-info"]},
+                            )
+                        )
+                elif rec.name.endswith("-ntlm-info"):
+                    script = {"id": rec.name, "output": rec.output, rec.name: rec.data}
+                    xmlnmap.post_ntlm_info(script, {}, {})
+                    self._write(
+                        update(self.tables.script)
+                        .where(
+                            and_(
+                                self.tables.script.port == rec.port,
+                                self.tables.script.name == rec.name,
+                            )
+                        )
+                        .values(
+                            name="ntlm-info",
+                            output=script["output"],
+                            data=script.get("ntlm-info", {}),
+                        )
+                    )
+        if failed:
+            cond = and_(cond, self.tables.scan.id.notin_(failed))
+        self._write(update(self.tables.scan).where(cond).values(schema_version=19))
+        return len(failed)
+
+    def count(self, flt, **_):
+        return self._read_one(
+            flt.query(select(func.count())).select_from(flt.select_from)
+        )[0]
+
+    @staticmethod
+    def _distinct_req(field, flt):
+        flt = flt.copy()
+        return flt.query(
+            select(field.distinct()).select_from(flt.select_from_base(field.parent))
+        )
+
+    def _get_open_port_count(self, flt, limit=None, skip=None):
+        req = flt.query(select(self.tables.scan.id))
+        if skip is not None:
+            req = req.offset(skip)
+        if limit is not None:
+            req = req.limit(limit)
+        base = req.cte("base")
+        return (
+            {"addr": rec[2], "starttime": rec[1], "openports": {"count": rec[0]}}
+            for rec in self._read_iter(
+                select(
+                    func.count(self.tables.port.id),
+                    self.tables.scan.time_start,
+                    self.tables.scan.addr,
+                )
+                .select_from(join(self.tables.port, self.tables.scan))
+                .where(self.tables.port.state == "open")
+                .group_by(self.tables.scan.addr, self.tables.scan.time_start)
+                # Wrap the CTE in an explicit ``select(...)`` for
+                # ``.in_(...)``: SQLAlchemy 2.x emits ``SAWarning:
+                # Coercing CTE object into a select() for use in
+                # IN()`` when a CTE is passed directly. Same fix
+                # applied to ``SQLDBActive.remove_many`` and
+                # ``SQLDBPassive.remove`` below.
+                .where(self.tables.scan.id.in_(select(base.c.id)))
+            )
+        )
+
+    def get_open_port_count(self, flt, limit=None, skip=None):
+        result = list(self._get_open_port_count(flt, limit=limit, skip=skip))
+        return result, len(result)
+
+    def getlocations(self, flt, limit=None, skip=None):
+        req = flt.query(
+            select(
+                func.count(self.tables.scan.id),
+                self.tables.scan.info["coordinates"].astext,
+            ).where(
+                self.tables.scan.info.has_key("coordinates")  # noqa: W601
+            ),
+        )
+        if skip is not None:
+            req = req.offset(skip)
+        if limit is not None:
+            req = req.limit(limit)
+        return (
+            {"_id": Point().result_processor(None, None)(rec[1]), "count": rec[0]}
+            for rec in self._read_iter(
+                req.group_by(self.tables.scan.info["coordinates"].astext)
+            )
+        )
+
+    def get_ips(self, flt, limit=None, skip=None):
+        return tuple(
+            action(flt, limit=limit, skip=skip) for action in [self.get, self.count]
+        )
+
+    def _get(self, flt, limit=None, skip=None, sort=None, fields=None):
+        if fields is not None:
+            utils.LOGGER.warning("Argument 'fields' provided but unused")
+        req = flt.query(
+            select(
+                self.tables.scan.id,
+                self.tables.scan.addr,
+                self.tables.scan.source,
+                self.tables.scan.info,
+                self.tables.scan.time_start,
+                self.tables.scan.time_stop,
+                self.tables.scan.state,
+                self.tables.scan.state_reason,
+                self.tables.scan.state_reason_ttl,
+                self.tables.scan.schema_version,
+                self.tables.scan.cpes,
+                self.tables.scan.os,
+                self.tables.scan.addresses,
+            ).select_from(flt.select_from)
+        )
+        for key, way in sort or []:
+            if isinstance(key, str) and key in self.fields:
+                key = self.fields[key]
+            req = req.order_by(key if way >= 0 else desc(key))
+        if skip is not None:
+            req = req.offset(skip)
+        if limit is not None:
+            req = req.limit(limit)
+        return req
+
+    def get(self, spec, limit=None, skip=None, sort=None, fields=None):
+        req = self._get(spec, limit=limit, skip=skip, sort=sort, fields=fields)
+        for scanrec in self._read_iter(req):
+            rec = {}
+            (
+                rec["_id"],
+                rec["addr"],
+                rec["source"],
+                rec["infos"],
+                rec["starttime"],
+                rec["endtime"],
+                rec["state"],
+                rec["state_reason"],
+                rec["state_reason_ttl"],
+                rec["schema_version"],
+                rec["cpes"],
+                rec["os"],
+                rec["addresses"],
+            ) = scanrec
+            try:
+                rec["addr"] = self.internal2ip(rec["addr"])
+            except ValueError:
+                pass
+            if not rec["infos"]:
+                del rec["infos"]
+            for key in ("cpes", "os", "addresses"):
+                if not rec[key]:
+                    del rec[key]
+            categories = (
+                select(self.tables.association_scan_category.category)
+                .where(self.tables.association_scan_category.scan == rec["_id"])
+                .cte("categories")
+            )
+            rec["categories"] = [
+                cat[0]
+                for cat in self._read_iter(
+                    select(self.tables.category.name).where(
+                        self.tables.category.id == categories.c.category
+                    )
+                )
+            ]
+            tags = {}
+            for tag in self._read_iter(
+                select(
+                    self.tables.tag.value, self.tables.tag.type, self.tables.tag.info
+                ).where(self.tables.tag.scan == rec["_id"])
+            ):
+                rect = {}
+                rect["value"], rect["type"], info = tag
+                cur_tag = tags.setdefault(rect["value"], rect)
+                if info:
+                    cur_tag.setdefault("info", set()).add(info)
+            if tags:
+                rec["tags"] = [
+                    dict(tag, info=sorted(tag["info"])) if "info" in tag else tag
+                    for tag in (tags[key] for key in sorted(tags))
+                ]
+            for port in self._read_iter(
+                select(self.tables.port).where(self.tables.port.scan == rec["_id"])
+            ):
+                recp = {}
+                (
+                    portid,
+                    _,
+                    recp["port"],
+                    recp["protocol"],
+                    recp["state_state"],
+                    recp["state_reason"],
+                    recp["state_reason_ip"],
+                    recp["state_reason_ttl"],
+                    recp["service_name"],
+                    recp["service_tunnel"],
+                    recp["service_product"],
+                    recp["service_version"],
+                    recp["service_conf"],
+                    recp["service_devicetype"],
+                    recp["service_extrainfo"],
+                    recp["service_hostname"],
+                    recp["service_ostype"],
+                    recp["service_servicefp"],
+                    recp["screenshot"],
+                    recp["screendata"],
+                    recp["screenwords"],
+                ) = port
+                try:
+                    recp["state_reason_ip"] = self.internal2ip(recp["state_reason_ip"])
+                except ValueError:
+                    pass
+                for fld, value in list(recp.items()):
+                    if value is None:
+                        del recp[fld]
+                for script in self._read_iter(
+                    select(
+                        self.tables.script.name,
+                        self.tables.script.output,
+                        self.tables.script.data,
+                    ).where(self.tables.script.port == portid)
+                ):
+                    data = {
+                        "id": script.name,
+                        "output": script.output,
+                        **(script.data if script.data else {}),
+                    }
+                    if "ssl-cert" in data:
+                        for cert in data["ssl-cert"]:
+                            for fld in ["not_before", "not_after"]:
+                                try:
+                                    cert[fld] = utils.all2datetime(cert[fld])
+                                except KeyError:
+                                    pass
+                    recp.setdefault("scripts", []).append(data)
+                rec.setdefault("ports", []).append(recp)
+            for trace in self._read_iter(
+                select(self.tables.trace).where(self.tables.trace.scan == rec["_id"])
+            ):
+                curtrace = {}
+                rec.setdefault("traces", []).append(curtrace)
+                # ``Row.__getitem__(str)`` was deprecated in 1.4
+                # and removed in 2.x; access via ``Row._mapping``
+                # works on both major versions.
+                trace_map = trace._mapping
+                curtrace["port"] = trace_map["port"]
+                curtrace["protocol"] = trace_map["protocol"]
+                curtrace["hops"] = []
+                for hop in self._read_iter(
+                    select(self.tables.hop)
+                    .where(self.tables.hop.trace == trace_map["id"])
+                    .order_by(self.tables.hop.ttl)
+                ):
+                    hop_map = hop._mapping
+                    values = {
+                        key: hop_map[key]
+                        for key in ["ipaddr", "ttl", "rtt", "host", "domains"]
+                    }
+                    try:
+                        values["ipaddr"] = self.internal2ip(values["ipaddr"])
+                    except ValueError:
+                        pass
+                    curtrace["hops"].append(values)
+            for hostname in self._read_iter(
+                select(self.tables.hostname).where(
+                    self.tables.hostname.scan == rec["_id"]
+                )
+            ):
+                hostname_map = hostname._mapping
+                rec.setdefault("hostnames", []).append(
+                    {key: hostname_map[key] for key in ["name", "type", "domains"]}
+                )
+            yield rec
+
+    def remove(self, host):
+        """Removes the host scan result. `host` must be a record as yielded by
+        .get().
+
+        """
+        self._write(delete(self.tables.scan).where(self.tables.scan.id == host["_id"]))
+
+    def remove_many(self, flt):
+        """Removes the host scan result. `flt` must be a valid NmapFilter()
+        instance.
+
+        """
+        base = flt.query(select(self.tables.scan.id)).cte("base")
+        # ``.in_(select(base.c.id))`` instead of ``.in_(base)``:
+        # SA 2.x emits ``SAWarning: Coercing CTE object into a
+        # select() for use in IN()`` when a CTE is passed directly.
+        self._write(
+            delete(self.tables.scan).where(self.tables.scan.id.in_(select(base.c.id)))
+        )
+
+    _topstructure = namedtuple(
+        "topstructure", ["base", "fields", "where", "group_by", "extraselectfrom"]
+    )
+    _topstructure.__new__.__defaults__ = (None,) * len(_topstructure._fields)
+
+    @classmethod
+    def searchnonexistent(cls):
+        return cls.base_filter(main=False)
+
+    @classmethod
+    def _searchobjectid(cls, oid, neg=False):
+        if len(oid) == 1:
+            return cls.base_filter(
+                main=(
+                    (cls.tables.scan.id != oid[0])
+                    if neg
+                    else (cls.tables.scan.id == oid[0])
+                )
+            )
+        return cls.base_filter(
+            main=(
+                (cls.tables.scan.id.notin_(oid[0]))
+                if neg
+                else (cls.tables.scan.id.in_(oid[0]))
+            )
+        )
+
+    @classmethod
+    def searchversion(cls, version):
+        return cls.base_filter(main=cls.tables.scan.schema_version == version)
+
+    @classmethod
+    def searchcmp(cls, key, val, cmpop):
+        if isinstance(key, str):
+            key = cls.fields[key]
+        return cls.base_filter(main=key.op(cmpop)(val))
+
+    @classmethod
+    def searchhost(cls, addr, neg=False):
+        """Filters (if `neg` == True, filters out) one particular host
+        (IP address).
+
+        """
+        if neg:
+            return cls.base_filter(main=cls.tables.scan.addr != cls.ip2internal(addr))
+        return cls.base_filter(main=cls.tables.scan.addr == cls.ip2internal(addr))
+
+    @classmethod
+    def searchhosts(cls, hosts, neg=False):
+        hosts = [cls.ip2internal(host) for host in hosts]
+        if neg:
+            return cls.base_filter(main=cls.tables.scan.addr.notin_(hosts))
+        return cls.base_filter(main=cls.tables.scan.addr.in_(hosts))
+
+    @classmethod
+    def searchrange(cls, start, stop, neg=False):
+        start, stop = cls.ip2internal(start), cls.ip2internal(stop)
+        if neg:
+            return cls.base_filter(
+                main=or_(cls.tables.scan.addr < start, cls.tables.scan.addr > stop)
+            )
+        return cls.base_filter(
+            main=and_(cls.tables.scan.addr >= start, cls.tables.scan.addr <= stop)
+        )
+
+    @classmethod
+    def searchdomain(cls, name, neg=False):
+        return cls.base_filter(
+            hostname=[
+                (
+                    not neg,
+                    cls._searchstring_re_inarray(
+                        cls.tables.hostname.id,
+                        cls.tables.hostname.domains,
+                        name,
+                        neg=False,
+                    ),
+                ),
+            ]
+        )
+
+    @classmethod
+    def searchhostname(cls, name=None, neg=False):
+        if name is None:
+            return cls.base_filter(hostname=[(not neg, True)])
+        return cls.base_filter(
+            hostname=[
+                (
+                    not neg,
+                    cls._searchstring_re(cls.tables.hostname.name, name, neg=False),
+                ),
+            ]
+        )
+
+    @classmethod
+    def searchcategory(cls, cat, neg=False):
+        return cls.base_filter(
+            category=[cls._searchstring_re(cls.tables.category.name, cat, neg=neg)]
+        )
+
+    @classmethod
+    def searchtag(cls, tag=None, neg=False):
+        """Filters (if `neg` == True, filters out) one particular tag (records
+        may have zero, one or more tags).
+
+        `tag` may be the value (as a str) or the tag (as a Tag, e.g.:
+        `{"value": value, "info": info}`).
+
+        Lifted to ``SQLDBActive`` so both ``SQLDBNmap`` and
+        ``SQLDBView`` inherit it -- both backends have a ``tag``
+        table in their ``tables`` namespace and accept the ``tag=``
+        keyword on their ``base_filter`` (``ActiveFilter`` and its
+        subclasses, ``ivre/db/sql/__init__.py:725``).
+        """
+        if not tag:
+            return cls.base_filter(tag=[(not neg, True)])
+        if not isinstance(tag, dict):
+            tag = {"value": tag}
+        req = [
+            cls._searchstring_re(getattr(cls.tables.tag, key), value)
+            for key, value in tag.items()
+        ]
+        return cls.base_filter(tag=[(not neg, and_(*req))])
+
+    @classmethod
+    def searchtext(cls, text, neg=False):
+        """Filter records that match the free-text ``text`` term
+        across every text-bearing column in the active schema
+        (``hostname.name``, ``tag.value`` / ``tag.info``,
+        ``port.service_*``, ``script.output``, ``hop.host``,
+        ``category.name``).
+
+        Mirrors the contract of :meth:`MongoDB.searchtext`,
+        which composes the same query against the MongoDB
+        text-index over :attr:`DBActive.text_fields`.  On the
+        SQL backends the dispatch happens at query-build time:
+        :meth:`ActiveFilter._text_predicate` builds an
+        ``OR``-of-``EXISTS`` over each text-bearing child
+        table, and each per-table predicate is itself an
+        ``OR`` of
+        ``to_tsvector('english', col) @@ plainto_tsquery('english', :term)``
+        across that table's text columns.
+
+        With ``neg=True`` the predicate is inverted: scans
+        whose entire text surface is *unrelated* to ``text``.
+        """
+        return cls.base_filter(text=[(not neg, text)])
+
+    @classmethod
+    def searchport(cls, port, protocol="tcp", state="open", neg=False):
+        """Filters (if `neg` == True, filters out) records with
+        specified protocol/port at required state. Be aware that when
+        a host has a lot of ports filtered or closed, it will not
+        report all of them, but only a summary, and thus the filter
+        might not work as expected. This filter will always work to
+        find open ports.
+
+        """
+        if port == "host":
+            return cls.base_filter(
+                port=[
+                    (
+                        True,
+                        (
+                            (cls.tables.port.port >= 0)
+                            if neg
+                            else (cls.tables.port.port == -1)
+                        ),
+                    ),
+                ]
+            )
+        return cls.base_filter(
+            port=[
+                (
+                    not neg,
+                    and_(
+                        cls.tables.port.port == port,
+                        cls.tables.port.protocol == protocol,
+                        cls.tables.port.state == state,
+                    ),
+                ),
+            ]
+        )
+
+    @classmethod
+    def searchportsother(cls, ports, protocol="tcp", state="open"):
+        """Filters records with at least one port other than those
+        listed in `ports` with state `state`.
+
+        """
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    and_(
+                        or_(
+                            cls.tables.port.port.notin_(ports),
+                            cls.tables.port.protocol != protocol,
+                        ),
+                        cls.tables.port.state == state,
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchports(cls, ports, protocol="tcp", state="open", neg=False, any_=False):
+        if any_:
+            if neg:
+                raise ValueError("searchports: cannot set both neg and any_")
+            return cls.base_filter(
+                port=[
+                    (
+                        True,
+                        and_(
+                            cls.tables.port.port.in_(ports),
+                            cls.tables.port.protocol == protocol,
+                            cls.tables.port.state == state,
+                        ),
+                    ),
+                ]
+            )
+        return cls.flt_and(
+            *(
+                cls.searchport(port, protocol=protocol, state=state, neg=neg)
+                for port in ports
+            )
+        )
+
+    @classmethod
+    def searchcountopenports(cls, minn=None, maxn=None, neg=False):
+        "Filters records with open port number between minn and maxn"
+        assert minn is not None or maxn is not None
+        req = select(column("scan", Integer)).select_from(
+            select(cls.tables.port.scan.label("scan"), func.count().label("count"))
+            .where(cls.tables.port.state == "open")
+            .group_by(cls.tables.port.scan)
+            .alias("pcnt")
+        )
+        if minn == maxn:
+            req = req.where(column("count") == minn)
+        else:
+            if minn is not None:
+                req = req.where(column("count") >= minn)
+            if maxn is not None:
+                req = req.where(column("count") <= maxn)
+        return cls.base_filter(
+            main=cls.tables.scan.id.notin_(req) if neg else cls.tables.scan.id.in_(req)
+        )
+
+    @classmethod
+    def searchopenport(cls, neg=False):
+        "Filters records with at least one open port."
+        return cls.base_filter(port=[(not neg, cls.tables.port.state == "open")])
+
+    @classmethod
+    def searchservice(cls, srv, port=None, protocol=None):
+        """Search an open port with a particular service."""
+        if srv is False:
+            req = cls.tables.port.service_name == None  # noqa: E711
+        elif isinstance(srv, list):
+            req = cls.tables.port.service_name.in_(srv)
+        else:
+            req = cls._searchstring_re(cls.tables.port.service_name, srv)
+        if port is not None:
+            req = and_(req, cls.tables.port.port == port)
+        if protocol is not None:
+            req = and_(req, cls.tables.port.protocol == protocol)
+        return cls.base_filter(port=[(True, req)])
+
+    @classmethod
+    def searchproduct(
+        cls, product=None, version=None, service=None, port=None, protocol=None
+    ):
+        """Search a port with a particular `product`. It is (much)
+        better to provide the `service` name and/or `port` number
+        since those fields are indexed.
+
+        """
+        req = True
+        if product is not None:
+            if product is False:
+                req = and_(
+                    req,
+                    cls.tables.port.service_product == None,  # noqa: E711
+                )
+            elif isinstance(product, list):
+                req = and_(
+                    req,
+                    cls.tables.port.service_product.in_(product),
+                )
+            else:
+                req = and_(
+                    req,
+                    cls._searchstring_re(
+                        cls.tables.port.service_product,
+                        product,
+                    ),
+                )
+        if version is not None:
+            if version is False:
+                req = and_(
+                    req,
+                    cls.tables.port.service_version == None,  # noqa: E711
+                )
+            elif isinstance(version, list):
+                req = and_(
+                    req,
+                    cls.tables.port.service_version.in_(version),
+                )
+            else:
+                req = and_(
+                    req, cls._searchstring_re(cls.tables.port.service_version, version)
+                )
+        if service is not None:
+            if service is False:
+                req = and_(
+                    req,
+                    cls.tables.port.service_name == None,  # noqa: E711
+                )
+            elif isinstance(service, list):
+                req = and_(
+                    req,
+                    cls.tables.port.service_name.in_(service),
+                )
+            else:
+                req = and_(
+                    req, cls._searchstring_re(cls.tables.port.service_name, service)
+                )
+        if port is not None:
+            req = and_(req, cls.tables.port.port == port)
+        if protocol is not None:
+            req = and_(req, cls.tables.port.protocol == protocol)
+        return cls.base_filter(port=[(True, req)])
+
+    @classmethod
+    def searchscript(cls, name=None, output=None, values=None, neg=False):
+        """Search a particular content in the scripts results.
+
+        If neg is True, filter out scan results which have at
+        least one script matching the name/output/value
+        """
+        req = True
+        if isinstance(name, list):
+            req = and_(req, cls.tables.script.name.in_(name))
+        elif name is not None:
+            req = and_(
+                req, cls._searchstring_re(cls.tables.script.name, name, neg=False)
+            )
+        if output is not None:
+            req = and_(
+                req, cls._searchstring_re(cls.tables.script.output, output, neg=False)
+            )
+        if values:
+            if isinstance(name, list):
+                all_keys = set(ALIASES_TABLE_ELEMS.get(n, n) for n in name)
+                if len(all_keys) != 1:
+                    raise TypeError(
+                        ".searchscript() needs similar `name` values when using a `values` arg"
+                    )
+                basekey = all_keys.pop()
+            elif not isinstance(name, str):
+                raise TypeError(
+                    ".searchscript() needs a `name` arg when using a `values` arg"
+                )
+            else:
+                basekey = ALIASES_TABLE_ELEMS.get(name, name)
+            if isinstance(values, (str, re.Pattern)):
+                needunwind = sorted(set(cls.needunwind_script(basekey)))
+            else:
+                needunwind = sorted(
+                    set(
+                        unwind
+                        for subkey in values
+                        for unwind in cls.needunwind_script(
+                            f"{basekey}.{subkey}",
+                        )
+                    )
+                )
+
+            def _find_subkey(key):
+                lastmatch = None
+                if key is None:
+                    key = []
+                else:
+                    key = key.split(".")
+                for subkey in needunwind:
+                    subkey = subkey.split(".")[1:]
+                    if len(key) < len(subkey):
+                        continue
+                    if key == subkey:
+                        return (".".join([basekey] + subkey), None)
+                    if subkey == key[: len(subkey)]:
+                        lastmatch = (
+                            ".".join([basekey] + subkey),
+                            ".".join(key[len(subkey) :]),
+                        )
+                return lastmatch
+
+            def _to_json(key, value):
+                key = key.split(".")
+                result = value
+                while key:
+                    result = {key.pop(): result}
+                return result
+
+            if isinstance(values, (str, re.Pattern)):
+                kv_generator = [(None, values)]
+            else:
+                kv_generator = values.items()
+
+            for key, value in kv_generator:
+                subkey = _find_subkey(key)
+                if subkey is None:
+                    if isinstance(value, re.Pattern):
+                        base = cls.tables.script.data.op("->")(basekey)
+                        key = key.split(".")
+                        lastkey = key.pop()
+                        for subkey in key:
+                            base = base.op("->")(subkey)
+                        base = base.op("->>")(lastkey)
+                        req = and_(
+                            req,
+                            cls._searchstring_re(base, value, neg=False),
+                        )
+                    elif isinstance(value, bool):
+                        base = cls.tables.script.data.op("->")(basekey)
+                        for subkey in key.split("."):
+                            base = base.op("->")(subkey)
+                        if neg:
+                            req = and_(req, base.cast(Boolean) != value)
+                        else:
+                            req = and_(req, base.cast(Boolean) == value)
+                    else:
+                        req = and_(
+                            req,
+                            cls.tables.script.data.contains(
+                                _to_json(f"{basekey}.{key}", value)
+                            ),
+                        )
+                elif subkey[1] is None:
+                    req = and_(
+                        req,
+                        cls._searchstring_re(
+                            column(subkey[0].replace(".", "_").replace("-", "_")).op(
+                                "->>"
+                            )(0),
+                            value,
+                            neg=False,
+                        ),
+                    )
+                elif "." in subkey[1]:
+                    firstpart, tail = subkey[1].split(".", 1)
+                    req = and_(
+                        req,
+                        column(subkey[0].replace(".", "_").replace("-", "_"))
+                        .op("->")(firstpart)
+                        .op("@>")(cast(_to_json(tail, value), JSONB)),
+                    )
+                elif isinstance(value, bool):
+                    base = (
+                        column(subkey[0].replace(".", "_").replace("-", "_"))
+                        .op("->")(subkey[1])
+                        .cast(Boolean)
+                    )
+                    if neg:
+                        req = and_(req, base != value)
+                    else:
+                        req = and_(req, base == value)
+                else:
+                    req = and_(
+                        req,
+                        cls._searchstring_re(
+                            column(subkey[0].replace(".", "_").replace("-", "_")).op(
+                                "->>"
+                            )(subkey[1]),
+                            value,
+                            neg=False,
+                        ),
+                    )
+            return cls.base_filter(
+                script=[
+                    (
+                        not neg,
+                        (
+                            req,
+                            [
+                                func.jsonb_array_elements(
+                                    cls.tables.script.data[subkey2]
+                                ).alias(subkey2.replace(".", "_").replace("-", "_"))
+                                for subkey2 in needunwind
+                            ],
+                        ),
+                    )
+                ]
+            )
+        return cls.base_filter(script=[(not neg, req)])
+
+    @classmethod
+    def searchsvchostname(cls, hostname):
+        return cls.base_filter(
+            port=[
+                (True, cls._searchstring_re(cls.tables.port.service_hostname, hostname))
+            ]
+        )
+
+    @classmethod
+    def searchwebmin(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    and_(
+                        cls.tables.port.service_name == "http",
+                        cls.tables.port.service_product == "MiniServ",
+                        cls.tables.port.service_extrainfo != "Webmin httpd",
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchx11(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    and_(
+                        cls.tables.port.service_name == "X11",
+                        cls.tables.port.service_extrainfo != "access denied",
+                    ),
+                )
+            ]
+        )
+
+    def searchtimerange(self, start, stop, neg=False):
+        start = utils.all2datetime(start)
+        stop = utils.all2datetime(stop)
+        if neg:
+            return self.base_filter(
+                main=(self.tables.scan.time_start < start)
+                | (self.tables.scan.time_stop > stop)
+            )
+        return self.base_filter(
+            main=(self.tables.scan.time_start >= start)
+            & (self.tables.scan.time_stop <= stop)
+        )
+
+    @classmethod
+    def searchfile(cls, fname=None, scripts=None):
+        """Search shared files from a file name (either a string or a
+        regexp), only from scripts using the "ls" NSE module.
+
+        """
+        if fname is None:
+            req = cls.tables.script.data.op("@>")(
+                '{"ls": {"volumes": [{"files": []}]}}'
+            )
+        else:
+            if isinstance(fname, (re.Pattern, list)):
+                base1 = (
+                    select(
+                        cls.tables.script.port,
+                        func.jsonb_array_elements(
+                            func.jsonb_array_elements(
+                                cls.tables.script.data["ls"]["volumes"]
+                            ).op("->")("files")
+                        )
+                        .op("->>")("filename")
+                        .label("filename"),
+                    )
+                    .where(
+                        cls.tables.script.data.op("@>")(
+                            '{"ls": {"volumes": [{"files": []}]}}'
+                        )
+                    )
+                    .cte("base1")
+                )
+                if isinstance(fname, list):
+                    where_clause = column("filename").in_(fname)
+                else:
+                    where_clause = column("filename").op(
+                        "~*" if (fname.flags & re.IGNORECASE) else "~"
+                    )(fname.pattern)
+                base2 = (
+                    select(column("port", Integer))
+                    .select_from(base1)
+                    .where(where_clause)
+                )
+                return cls.base_filter(port=[(True, cls.tables.port.id.in_(base2))])
+            req = cls.tables.script.data.op("@>")(
+                json.dumps({"ls": {"volumes": [{"files": [{"filename": fname}]}]}})
+            )
+        if scripts is None:
+            return cls.base_filter(script=[(True, req)])
+        if isinstance(scripts, str):
+            scripts = [scripts]
+        if len(scripts) == 1:
+            return cls.base_filter(
+                script=[(True, and_(cls.tables.script.name == scripts.pop(), req))]
+            )
+        return cls.base_filter(
+            script=[(True, and_(cls.tables.script.name.in_(scripts), req))]
+        )
+
+    @classmethod
+    def searchhttptitle(cls, title):
+        return cls.base_filter(
+            script=[
+                (True, cls.tables.script.name.in_(["http-title", "html-title"])),
+                (True, cls._searchstring_re(cls.tables.script.output, title)),
+            ]
+        )
+
+    @classmethod
+    def searchhop(cls, hop, ttl=None, neg=False):
+        res = cls.tables.hop.ipaddr == cls.ip2internal(hop)
+        if ttl is not None:
+            res &= cls.tables.hop.ttl == ttl
+        return cls.base_filter(trace=[not_(res) if neg else res])
+
+    @classmethod
+    def searchhopdomain(cls, hop, neg=False):
+        return cls.base_filter(
+            trace=[
+                cls._searchstring_re_inarray(
+                    cls.tables.hop.id, cls.tables.hop.domains, hop, neg=neg
+                )
+            ]
+        )
+
+    @classmethod
+    def searchhopname(cls, hop, neg=False):
+        return cls.base_filter(
+            trace=[cls._searchstring_re(cls.tables.hop.host, hop, neg=neg)]
+        )
+
+    @classmethod
+    def searchdevicetype(cls, devtype):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    cls._searchstring_re(cls.tables.port.service_devicetype, devtype),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchnetdev(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    cls.tables.port.service_devicetype.in_(
+                        [
+                            "bridge",
+                            "broadband router",
+                            "firewall",
+                            "hub",
+                            "load balancer",
+                            "proxy server",
+                            "router",
+                            "switch",
+                            "WAP",
+                        ]
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchphonedev(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    cls.tables.port.service_devicetype.in_(
+                        [
+                            "PBX",
+                            "phone",
+                            "telecom-misc",
+                            "VoIP adapter",
+                            "VoIP phone",
+                        ]
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchldapanon(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    cls.tables.port.service_extrainfo == "Anonymous bind OK",
+                )
+            ]
+        )
+
+    @classmethod
+    def searchvsftpdbackdoor(cls):
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    and_(
+                        cls.tables.port.protocol == "tcp",
+                        cls.tables.port.state == "open",
+                        cls.tables.port.service_product == "vsftpd",
+                        cls.tables.port.service_version == "2.3.4",
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchvulnintersil(cls):
+        # See MSF modules/auxiliary/admin/http/intersil_pass_reset.rb
+        return cls.base_filter(
+            port=[
+                (
+                    True,
+                    and_(
+                        cls.tables.port.protocol == "tcp",
+                        cls.tables.port.state == "open",
+                        cls.tables.port.service_product == "Boa HTTPd",
+                        cls._searchstring_re(
+                            cls.tables.port.service_version,
+                            re.compile(
+                                "^0\\.9(3([^0-9]|$)"
+                                "|4\\.([0-9]|0[0-9]|1[0-1])([^0-9]|$))"
+                            ),
+                        ),
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchcpe(cls, cpe_type=None, vendor=None, product=None, version=None):
+        """Filter records carrying a CPE matching the given criteria.
+        Each kwarg accepts a string, a list of strings, or a compiled
+        regex. With no argument the filter only checks for the
+        presence of at least one CPE entry.
+
+        Mirrors the contract of :meth:`MongoDB.searchcpe`. The CPE
+        list is stored verbatim from the Mongo-shape host record on
+        the ``scan.cpes`` JSONB column; matching is performed by
+        unwinding that array via :func:`jsonb_array_elements` and
+        AND-combining the per-field predicates inside an ``EXISTS``.
+        """
+        fields = [
+            ("type", cpe_type),
+            ("vendor", vendor),
+            ("product", product),
+            ("version", version),
+        ]
+        flt = [(field, value) for field, value in fields if value is not None]
+        if not flt:
+            return cls.base_filter(
+                main=cls.tables.scan.cpes != None,  # noqa: E711
+            )
+        cpe_alias = func.jsonb_array_elements(cls.tables.scan.cpes).alias("__cpe")
+        conds = [
+            cls._search_field(column("__cpe").op("->>")(fname), value)
+            for fname, value in flt
+        ]
+        return cls.base_filter(
+            main=and_(
+                cls.tables.scan.cpes != None,  # noqa: E711
+                exists(select(1).select_from(cpe_alias).where(and_(*conds))),
+            ),
+        )
+
+    @classmethod
+    def searchos(cls, txt):
+        """Filter records whose OS detection (``osclass`` array)
+        matches ``txt`` on at least one of vendor / family /
+        generation / type. ``txt`` may be a string or a compiled
+        regex.
+
+        Mirrors :meth:`MongoDB.searchos`. The Mongo-shape ``host['os']``
+        dict is stored verbatim on the ``scan.os`` JSONB column; the
+        ``osclass`` sub-array is unwound via :func:`jsonb_array_elements`
+        and the per-field predicates are OR-combined inside an
+        ``EXISTS``.
+        """
+        osclass_alias = func.jsonb_array_elements(
+            cls.tables.scan.os.op("->")("osclass")
+        ).alias("__osclass")
+        conds = or_(
+            *(
+                cls._searchstring_re(column("__osclass").op("->>")(fname), txt)
+                for fname in ("vendor", "osfamily", "osgen", "type")
+            )
+        )
+        return cls.base_filter(
+            main=and_(
+                cls.tables.scan.os != None,  # noqa: E711
+                func.jsonb_typeof(cls.tables.scan.os.op("->")("osclass")) == "array",
+                exists(select(1).select_from(osclass_alias).where(conds)),
+            ),
+        )
+
+    @classmethod
+    def searchvuln(cls, vulnid=None, state=None):
+        """Filter records that expose a vulnerability matching
+        ``vulnid`` and / or ``state``. With both args ``None`` the
+        filter accepts any host with at least one detected
+        vulnerability.
+
+        Mirrors :meth:`MongoDB.searchvuln`. Vulnerabilities are
+        stored as part of the script ``data`` JSONB at
+        ``data['vulns']`` (a list of ``{id, state, ...}`` entries
+        post-schema-v8 migration); the array is unwound via
+        :func:`jsonb_array_elements` and the per-field predicates
+        are AND-combined inside a correlated ``EXISTS``.
+        """
+        vuln_alias = func.jsonb_array_elements(
+            cls.tables.script.data.op("->")("vulns")
+        ).alias("__vuln")
+        inner_conds = []
+        if vulnid is not None:
+            inner_conds.append(
+                cls._search_field(column("__vuln").op("->>")("id"), vulnid)
+            )
+        if state is not None:
+            inner_conds.append(
+                cls._search_field(column("__vuln").op("->>")("state"), state)
+            )
+        inner_where = and_(*inner_conds) if inner_conds else true()
+        return cls.base_filter(
+            script=[
+                (
+                    True,
+                    and_(
+                        func.jsonb_typeof(cls.tables.script.data.op("->")("vulns"))
+                        == "array",
+                        exists(select(1).select_from(vuln_alias).where(inner_where)),
+                    ),
+                )
+            ]
+        )
+
+    @classmethod
+    def searchscreenshot(
+        cls,
+        port=None,
+        protocol="tcp",
+        service=None,
+        words=None,
+        neg=False,
+    ):
+        """Filter records that have (or, with ``neg=True``, lack)
+        a screenshot on at least one port.
+
+        Mirrors the contract of :meth:`MongoDB.searchscreenshot`.
+        ``port`` / ``protocol`` / ``service`` constrain the
+        matching port; ``words`` filters on the OCR word list:
+
+        * ``None``: only the existence (or absence, on
+          ``neg=True``) of a screenshot is checked.
+        * ``bool``: filter ports with (``True``) or without
+          (``False``) any OCR word; ``neg`` is ignored.
+        * ``str``: case-insensitive equality (after
+          lower-casing) against any element of the
+          ``screenwords`` array.
+        * regex: case-(in)sensitive regex match against any
+          element of the array.
+        * ``list``: every element must match (``$all`` on Mongo,
+          ``screenwords @> ARRAY[...]`` here).
+
+        With ``words is not None`` and ``neg=True`` the predicate
+        means "has a screenshot **without** the requested words",
+        matching the Mongo helper.
+
+        Note the Mongo-shape semantics for ``neg=True`` when no
+        port / service / words constraint is present:
+        ``{"ports.screenshot": {"$exists": false}}`` matches
+        hosts where **no** port has a screenshot, *not* hosts
+        with at least one port without one (which is almost
+        every host).  The SQL equivalent flips at the
+        ``EXISTS`` level (``base_filter(port=[(False, ...)])``)
+        rather than at the inner predicate.  Once a port /
+        service / words constraint is present the flip happens
+        at the inner predicate, matching Mongo's
+        ``$elemMatch`` semantics.
+        """
+        port_t = cls.tables.port
+        if words is None:
+            screenshot_exists = port_t.screenshot != None  # noqa: E711
+            if port is None and service is None:
+                # ``ports.screenshot.$exists: false`` means *no*
+                # port has a screenshot -- flip at the EXISTS
+                # level via the ``incl=False`` slot.
+                return cls.base_filter(port=[(not neg, screenshot_exists)])
+            conds = [
+                port_t.screenshot == None if neg else screenshot_exists,  # noqa: E711
+            ]
+            if port is not None:
+                conds.extend([port_t.port == port, port_t.protocol == protocol])
+            if service is not None:
+                conds.append(port_t.service_name == service)
+            return cls.base_filter(port=[(True, and_(*conds))])
+        # ``words`` is set: a screenshot must always exist.
+        conds = [port_t.screenshot != None]  # noqa: E711
+        if isinstance(words, bool):
+            conds.append(
+                port_t.screenwords == None  # noqa: E711
+                if not words
+                else port_t.screenwords != None  # noqa: E711
+            )
+        elif isinstance(words, list):
+            lowered = [w.lower() for w in words]
+            if neg:
+                # PG / DuckDB ``arr @> ARRAY[...]`` returns NULL
+                # when ``arr`` is NULL, and ``NOT NULL`` is NULL
+                # in three-valued logic -- a port with no OCR
+                # words would be silently dropped from the neg
+                # side.  Mongo's ``$ne`` matches missing fields,
+                # so add an explicit ``IS NULL`` branch to keep
+                # cross-backend parity.
+                conds.append(
+                    or_(
+                        port_t.screenwords == None,  # noqa: E711
+                        not_(port_t.screenwords.contains(lowered)),
+                    )
+                )
+            else:
+                conds.append(port_t.screenwords.contains(lowered))
+        elif isinstance(words, re.Pattern):
+            # Match any array element against the regex.  Use
+            # the table-valued-function ``AS __sw(v)`` form
+            # (PostgreSQL and DuckDB both accept it) so the
+            # SRF's single column is exposed as ``__sw.v``.
+            #
+            # The ``render_derived`` keyword is what makes
+            # SQLAlchemy emit the explicit column-list alias
+            # ``AS __sw(v)`` rather than the bare ``AS __sw``
+            # shape ``table_valued`` defaults to -- without it
+            # PostgreSQL would reject ``__sw.v`` (column
+            # doesn't exist) and DuckDB would parse the alias
+            # as a STRUCT column.  Side benefit: SA emits the
+            # SRF directly in the ``FROM`` clause without
+            # wrapping it in a sub-SELECT, so the SRF stays
+            # implicitly lateral on PostgreSQL (and DuckDB
+            # treats the inline SRF the same way) -- a plain
+            # ``select(...).subquery()`` wrapper *decorrelates*
+            # the call and makes the unwind expand over every
+            # ``port.screenwords`` row in the database, which
+            # silently matches every host with a screenshot
+            # whenever the predicate matches anywhere.
+            #
+            # ``unnest(NULL)`` is zero rows on both backends,
+            # so ``NOT EXISTS`` naturally matches NULL
+            # ``screenwords`` -- no explicit ``IS NULL`` branch
+            # needed for the negated side here.
+            sw_alias = (
+                func.unnest(port_t.screenwords)
+                .table_valued("v")
+                .render_derived(name="__sw", with_types=False)
+            )
+            sw_pred = cls._searchstring_re(sw_alias.c.v, words)
+            inner = exists(select(1).select_from(sw_alias).where(sw_pred))
+            conds.append(not_(inner) if neg else inner)
+        else:  # plain string
+            lowered = words.lower()
+            if neg:
+                # Same NULL-handling rationale as the list path
+                # above.
+                conds.append(
+                    or_(
+                        port_t.screenwords == None,  # noqa: E711
+                        not_(port_t.screenwords.any(lowered)),
+                    )
+                )
+            else:
+                conds.append(port_t.screenwords.any(lowered))
+        if port is not None:
+            conds.extend([port_t.port == port, port_t.protocol == protocol])
+        if service is not None:
+            conds.append(port_t.service_name == service)
+        return cls.base_filter(port=[(True, and_(*conds))])
+
+    @classmethod
+    def searchsmbshares(cls, access="", hidden=None):
+        """Filter SMB shares with the given ``access`` (default:
+        either read or write, accepted values 'r', 'w', 'rw').
+
+        ``hidden=True`` selects hidden shares only,
+        ``hidden=False`` non-hidden only, ``None`` (the default)
+        accepts either.
+
+        Mirrors :meth:`MongoDB.searchsmbshares`.  The Mongo
+        contract delegates to ``searchscript`` with a nested
+        ``$elemMatch`` / ``$or`` / ``$nin`` shape that the
+        existing SQL ``searchscript`` value-translator does not
+        cover; this implementation builds the equivalent
+        predicate directly against ``script.data['shares']``.
+        """
+        access_pattern = {
+            "": re.compile("^(READ|WRITE)"),
+            "r": re.compile("^READ(/|$)"),
+            "w": re.compile("(^|/)WRITE$"),
+            "rw": "READ/WRITE",
+            "wr": "READ/WRITE",
+        }[access.lower()]
+        excluded_share_types = (
+            "STYPE_IPC_HIDDEN",
+            "Not a file share",
+            "STYPE_IPC",
+            "STYPE_PRINTQ",
+        )
+        share_alias = func.jsonb_array_elements(
+            cls.tables.script.data.op("->")("shares")
+        ).alias("__share")
+        share_col = column("__share")
+        access_match = or_(
+            cls._search_field(share_col.op("->>")("Anonymous access"), access_pattern),
+            cls._search_field(
+                share_col.op("->>")("Current user access"), access_pattern
+            ),
+        )
+        type_col = share_col.op("->>")("Type")
+        if hidden is None:
+            type_match = type_col.notin_(excluded_share_types)
+        elif hidden:
+            type_match = type_col == "STYPE_DISKTREE_HIDDEN"
+        else:
+            type_match = type_col == "STYPE_DISKTREE"
+        share_name_match = share_col.op("->>")("Share") != "IPC$"
+        return cls.base_filter(
+            script=[
+                (
+                    True,
+                    and_(
+                        cls.tables.script.name == "smb-enum-shares",
+                        func.jsonb_typeof(cls.tables.script.data.op("->")("shares"))
+                        == "array",
+                        exists(
+                            select(1)
+                            .select_from(share_alias)
+                            .where(
+                                and_(
+                                    access_match,
+                                    type_match,
+                                    share_name_match,
+                                )
+                            )
+                        ),
+                    ),
+                )
+            ]
+        )
+
+    def removescreenshot(self, host, port=None, protocol="tcp"):
+        """Clear screenshot fields on the matching port row(s) of
+        the given host record (in the database) and on the
+        in-memory ``host`` dict (so subsequent caller logic sees
+        the post-removal shape).
+
+        Mirrors :meth:`MongoDB.removescreenshot`.
+        """
+        # Mutate the in-memory dict to match Mongo's behaviour.
+        for portrec in host.get("ports", []):
+            if port is not None and (
+                portrec.get("port") != port or portrec.get("protocol") != protocol
+            ):
+                continue
+            if "screenshot" not in portrec:
+                continue
+            portrec.pop("screendata", None)
+            portrec.pop("screenwords", None)
+            portrec.pop("screenshot", None)
+        # And issue the DB UPDATE.
+        port_t = self.tables.port
+        update_filter = port_t.scan == host.get("_id")
+        if port is not None:
+            update_filter = and_(
+                update_filter,
+                port_t.port == port,
+                port_t.protocol == protocol,
+            )
+        self._write(
+            update(port_t)
+            .where(update_filter)
+            .values(screenshot=None, screendata=None, screenwords=None)
+        )
+
+    def setscreenshot(self, host, port, data, protocol="tcp", overwrite=False):
+        """Set the content of a port's screenshot on the matching
+        port row.  Mirrors :meth:`MongoDB.setscreenshot`.
+
+        Trims the image (drops uniform borders via
+        :func:`ivre.utils.trim_image`); if trimming consumes the
+        whole picture the screenshot is recorded as ``"empty"``
+        with no ``screendata``.  Otherwise the trimmed bytes
+        land in ``screendata`` and the OCR word list is derived
+        via :func:`ivre.utils.screenwords` and written to
+        ``screenwords``.
+
+        ``overwrite=False`` is a no-op when the port already has
+        a screenshot.
+        """
+        port_t = self.tables.port
+        # Locate the port subdoc on the in-memory record so we
+        # can mirror Mongo's mutation behaviour and short-circuit
+        # the no-op when ``overwrite=False``.
+        try:
+            port_rec = next(
+                p
+                for p in host.get("ports", [])
+                if p.get("port") == port and p.get("protocol") == protocol
+            )
+        except StopIteration as exc:
+            raise KeyError(f"Port {protocol}/{port} does not exist") from exc
+        if "screenshot" in port_rec and not overwrite:
+            return
+        trim_result = utils.trim_image(data)
+        update_filter = and_(
+            port_t.scan == host.get("_id"),
+            port_t.port == port,
+            port_t.protocol == protocol,
+        )
+        if trim_result is False:
+            # Image vanished after trim -- record the empty
+            # marker and clear any leftover data / words.
+            port_rec["screenshot"] = "empty"
+            port_rec.pop("screendata", None)
+            port_rec.pop("screenwords", None)
+            self._write(
+                update(port_t)
+                .where(update_filter)
+                .values(screenshot="empty", screendata=None, screenwords=None)
+            )
+            return
+        port_rec["screenshot"] = "field"
+        if trim_result is not True:
+            data = trim_result
+        port_rec["screendata"] = data
+        screenwords = utils.screenwords(data)
+        if screenwords is not None:
+            port_rec["screenwords"] = screenwords
+        self._write(
+            update(port_t)
+            .where(update_filter)
+            .values(
+                screenshot="field",
+                screendata=data,
+                screenwords=screenwords,
+            )
+        )
+
+    def setscreenwords(self, host, port=None, protocol="tcp", overwrite=False):
+        """(Re)compute the OCR word list for ports that have a
+        screenshot but lack ``screenwords`` (or all of them when
+        ``overwrite=True``).  Mirrors
+        :meth:`MongoDB.setscreenwords`.
+        """
+        port_t = self.tables.port
+        for port_rec in host.get("ports", []):
+            if port is not None and (
+                port_rec.get("port") != port or port_rec.get("protocol") != protocol
+            ):
+                continue
+            if "screenshot" not in port_rec:
+                continue
+            if "screenwords" in port_rec and not overwrite:
+                continue
+            data = port_rec.get("screendata")
+            if not data:
+                continue
+            words = utils.screenwords(data)
+            if words is None:
+                continue
+            port_rec["screenwords"] = words
+            self._write(
+                update(port_t)
+                .where(
+                    and_(
+                        port_t.scan == host.get("_id"),
+                        port_t.port == port_rec["port"],
+                        port_t.protocol == port_rec["protocol"],
+                    )
+                )
+                .values(screenwords=words)
+            )
+
+    @classmethod
+    def searchtimeago(cls, delta, neg=False):
+        """Filter scans whose ``time_stop`` (i.e. last activity)
+        is more recent (or older, with ``neg=True``) than
+        ``datetime.now() - delta``.  Mirrors the Mongo helper at
+        :meth:`MongoDB.searchtimeago` (active class).
+
+        ``delta`` can be a :class:`datetime.timedelta` or a
+        scalar number of seconds.
+        """
+        if not isinstance(delta, datetime.timedelta):
+            delta = datetime.timedelta(seconds=delta)
+        cutoff = datetime.datetime.now() - delta
+        time_stop = cls.tables.scan.time_stop
+        return cls.base_filter(main=time_stop < cutoff if neg else time_stop >= cutoff)
+
+    @classmethod
+    def searchmac(cls, mac=None, neg=False):
+        """Filter active scans by MAC address.  ``mac`` may be a
+        string (case-insensitive equality, lower-cased to match
+        the stored shape), a regex, or ``None`` (existence check).
+
+        Mirrors :meth:`MongoDB.searchmac` for the active class.
+        The Mongo path queries ``addresses.mac`` directly; here
+        the same JSONB array is unwound via
+        :func:`jsonb_array_elements_text` and each element is
+        matched per-row inside an ``EXISTS``.  ``LATERAL`` is
+        required so the inner SRF correlates with the outer
+        ``scan`` row -- without it the unwind decorrelates and
+        any matching MAC anywhere in the database would match
+        every scan.
+
+        Existence is a portable ``addresses -> 'mac' IS NOT NULL``
+        check rather than the PG-only ``?`` operator (DuckDB's
+        JSON dialect does not provide it).
+        """
+        scan = cls.tables.scan
+        mac_field = scan.addresses.op("->")("mac")
+        if mac is None:
+            has_mac = mac_field != None  # noqa: E711
+            return cls.base_filter(main=not_(has_mac) if neg else has_mac)
+        # See :meth:`searchscreenshot` for the
+        # ``table_valued().render_derived()`` rationale (clean
+        # ``AS __mac(v)`` syntax that both PostgreSQL and DuckDB
+        # accept, with the SRF's outer-row reference staying
+        # correlated rather than decorrelated by a sub-SELECT
+        # wrapper).
+        mac_alias = (
+            func.jsonb_array_elements_text(mac_field)
+            .table_valued("v")
+            .render_derived(name="__mac", with_types=False)
+        )
+        if isinstance(mac, re.Pattern):
+            mac = re.compile(mac.pattern, mac.flags | re.IGNORECASE)
+            elt_pred = cls._searchstring_re(mac_alias.c.v, mac)
+        else:
+            elt_pred = mac_alias.c.v == mac.lower()
+        inner = exists(select(1).select_from(mac_alias).where(elt_pred))
+        return cls.base_filter(
+            main=and_(
+                scan.addresses != None,  # noqa: E711
+                func.jsonb_typeof(mac_field) == "array",
+                not_(inner) if neg else inner,
+            )
+        )
+
+    def get_mean_open_ports(self, flt):
+        """Server-side equivalent of the Python-loop fallback
+        :meth:`DBActive.get_mean_open_ports` ships in the base
+        class.  Returns an iterable of ``{"id", "mean"}`` dicts
+        where ``mean`` is ``count_of_open_ports * sum_of_open_port_numbers``.
+
+        Mongo runs the same arithmetic via the aggregation
+        framework; the SQL backends compute it in a single
+        ``GROUP BY scan.id`` against the ``port`` table joined
+        with the active filter.
+        """
+        scan_t = self.tables.scan
+        port_t = self.tables.port
+        base = flt.query(select(scan_t.id).select_from(flt.select_from)).cte(
+            "scans_in_flt"
+        )
+        cnt = func.count(port_t.id)
+        port_sum = func.coalesce(func.sum(port_t.port), 0)
+        stmt = (
+            select(scan_t.id.label("id"), (cnt * port_sum).label("mean"))
+            .select_from(scan_t)
+            .where(scan_t.id.in_(select(base.c.id)))
+            .outerjoin(
+                port_t,
+                and_(port_t.scan == scan_t.id, port_t.state == "open"),
+            )
+            .group_by(scan_t.id)
+        )
+        return [{"id": row[0], "mean": row[1]} for row in self._read_iter(stmt)]
+
+    @classmethod
+    def searchhassh(cls, value_or_hash=None, server=None):
+        if server is None:
+            return cls._searchhassh(value_or_hash=value_or_hash)
+        if server:
+            portflt = cls.tables.port.port != -1
+        else:
+            portflt = cls.tables.port.port == -1
+        if value_or_hash is None:
+            return cls.base_filter(
+                script=[
+                    (
+                        True,
+                        and_(
+                            portflt,
+                            cls.tables.script.name == "ssh2-enum-algos",
+                        ),
+                    )
+                ]
+            )
+        key, value = cls._ja3keyvalue(value_or_hash)
+        return cls.base_filter(
+            script=[
+                (
+                    True,
+                    and_(
+                        portflt,
+                        cls.tables.script.name == "ssh2-enum-algos",
+                        cls._searchstring_re(
+                            cls.tables.script.data.op("->")("ssh2-enum-algos")
+                            .op("->")("hassh")
+                            .op("->>")(key),
+                            value,
+                        ),
+                    ),
+                )
+            ]
+        )
+
+
+class SQLDBNmap(SQLDBActive, DBNmap):
+    table_layout = namedtuple(
+        "nmap_layout",
+        [
+            "category",
+            "scan",
+            "hostname",
+            "port",
+            "script",
+            "tag",
+            "trace",
+            "hop",
+            "association_scan_hostname",
+            "association_scan_category",
+        ],
+    )
+    tables = table_layout(
+        N_Category,
+        N_Scan,
+        N_Hostname,
+        N_Port,
+        N_Script,
+        N_Tag,
+        N_Trace,
+        N_Hop,
+        N_Association_Scan_Hostname,
+        N_Association_Scan_Category,
+    )
+    fields = {
+        "_id": N_Scan.id,
+        "addr": N_Scan.addr,
+        "source": N_Scan.source,
+        "starttime": N_Scan.time_start,
+        "endtime": N_Scan.time_stop,
+        "infos": N_Scan.info,
+        "ports": N_Port,
+        "tags": N_Tag,
+        "state": N_Scan.state_reason_ttl,
+        "state_reason": N_Scan.state_reason_ttl,
+        "state_reason_ttl": N_Scan.state_reason_ttl,
+        "schema_version": N_Scan.schema_version,
+        "categories": N_Category.name,
+        "hostnames.name": N_Hostname.name,
+        "hostnames.domains": N_Hostname.domains,
+    }
+
+    base_filter = NmapFilter
+    content_handler = xmlnmap.Nmap2DB
+
+    def store_or_merge_host(self, host):
+        self.store_host(host)
+
+    @classmethod
+    def searchsource(cls, src, neg=False):
+        return cls.base_filter(
+            main=cls._search_field(cls.tables.scan.source, src, neg=neg)
+        )
+
+
+class SQLDBView(SQLDBActive, DBView):
+    table_layout = namedtuple(
+        "view_layout",
+        [
+            "category",
+            "scan",
+            "hostname",
+            "port",
+            "script",
+            "tag",
+            "trace",
+            "hop",
+            "association_scan_hostname",
+            "association_scan_category",
+        ],
+    )
+    tables = table_layout(
+        V_Category,
+        V_Scan,
+        V_Hostname,
+        V_Port,
+        V_Script,
+        V_Tag,
+        V_Trace,
+        V_Hop,
+        V_Association_Scan_Hostname,
+        V_Association_Scan_Category,
+    )
+    fields = {
+        "_id": V_Scan.id,
+        "addr": V_Scan.addr,
+        "source": V_Scan.source,
+        "starttime": V_Scan.time_start,
+        "endtime": V_Scan.time_stop,
+        "infos": V_Scan.info,
+        "ports": V_Port,
+        "tags": V_Tag,
+        "state": V_Scan.state_reason_ttl,
+        "state_reason": V_Scan.state_reason_ttl,
+        "state_reason_ttl": V_Scan.state_reason_ttl,
+        "schema_version": V_Scan.schema_version,
+        "categories": V_Category.name,
+        "hostnames.name": V_Hostname.name,
+        "hostnames.domains": V_Hostname.domains,
+    }
+
+    base_filter = ViewFilter
+
+    def store_or_merge_host(self, host):
+        # TODO: merge?
+        self.store_host(host)
+
+    @classmethod
+    def searchsource(cls, src, neg=False):
+        return cls.base_filter(
+            main=cls._searchstring_re_inarray(
+                cls.tables.scan.id, cls.tables.scan.source, src, neg=neg
+            )
+        )
+
+    @classmethod
+    def searchcountry(cls, country, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        country, or a list of countries.
+
+        """
+        country = utils.country_unalias(country)
+        return cls.base_filter(
+            main=cls._search_field(
+                cls.tables.scan.info["country_code"].astext, country, neg=neg
+            )
+        )
+
+    @classmethod
+    def searchcity(cls, city, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        city
+
+        """
+        return cls.base_filter(
+            main=cls._searchstring_re(
+                cls.tables.scan.info["city"].astext, city, neg=neg
+            )
+        )
+
+    @classmethod
+    def searchasnum(cls, asnum, neg=False):
+        """Filters (if `neg` == True, filters out) one or more
+        particular AS number(s).
+
+        """
+        return cls.base_filter(
+            main=cls._search_field(
+                cls.tables.scan.info["as_num"], asnum, neg=neg, map_=str
+            )
+        )
+
+    @classmethod
+    def searchasname(cls, asname, neg=False):
+        """Filters (if `neg` == True, filters out) one or more
+        particular AS.
+
+        """
+        return cls.base_filter(
+            main=cls._searchstring_rec(
+                cls.tables.scan.info["as_name"].astext, asname, neg=neg
+            )
+        )
+
+    @classmethod
+    def searchhaslocation(cls, neg=False):
+        """Filter records carrying GeoIP coordinates on
+        ``info.loc`` (or, with ``neg=True``, records that
+        don't).  Mirrors :meth:`MongoDB.searchhaslocation` --
+        the Mongo path checks ``{"infos.loc": {"$exists":
+        not neg}}``.
+        """
+        loc = cls.tables.scan.info.op("->")("loc")
+        has_loc = loc != None  # noqa: E711
+        return cls.base_filter(main=not_(has_loc) if neg else has_loc)
+
+
+class PassiveFilter(Filter):
+    def __init__(self, main=None, tables=None):
+        self.main = main
+        self.tables = SQLDBPassive.tables if tables is None else tables
+
+    @property
+    def all_queries(self):
+        return {
+            "main": self.main,
+            "tables": self.tables,
+        }
+
+    def __bool__(self):
+        return self.main is not None
+
+    def copy(self):
+        return self.__class__(
+            main=self.main,
+            tables=self.tables,
+        )
+
+    def __and__(self, other):
+        if self.tables != other.tables:
+            raise ValueError("Cannot 'AND' two filters on separate tables")
+        return self.__class__(
+            main=self.fltand(self.main, other.main),
+            tables=self.tables,
+        )
+
+    def __or__(self, other):
+        if self.tables != other.tables:
+            raise ValueError("Cannot 'OR' two filters on separate tables")
+        return self.__class__(
+            main=self.fltor(self.main, other.main),
+            tables=self.tables,
+        )
+
+    @property
+    def select_from(self):
+        return self.tables.passive
+
+    def query(self, req):
+        if self.main is not None:
+            req = req.where(self.main)
+        return req
+
+
+class SQLDBPassive(SQLDB, DBPassive):
+    table_layout = namedtuple("passive_layout", ["passive"])
+    tables = table_layout(Passive)
+    fields = {
+        "_id": Passive.id,
+        "addr": Passive.addr,
+        "sensor": Passive.sensor,
+        "count": Passive.count,
+        "firstseen": Passive.firstseen,
+        "lastseen": Passive.lastseen,
+        "distance": Passive.info.op("->>")("distance"),
+        "signature": Passive.info.op("->>")("signature"),
+        "version": Passive.info.op("->>")("version"),
+        "infos": Passive.moreinfo,
+        "infos.domain": Passive.moreinfo.op("->>")("domain"),
+        "infos.issuer": Passive.moreinfo.op("->>")("issuer"),
+        "infos.issuer_text": Passive.moreinfo.op("->>")("issuer_text"),
+        "infos.md5": Passive.moreinfo.op("->>")("md5"),
+        "infos.pubkey.type": (Passive.moreinfo.op("->")("pubkey").op("->>")("type")),
+        "infos.self_signed": Passive.moreinfo.op("->")("self_signed"),
+        "infos.san": Passive.moreinfo.op("->>")("san"),
+        "infos.sha1": Passive.moreinfo.op("->>")("sha1"),
+        "infos.sha256": Passive.moreinfo.op("->>")("sha256"),
+        "infos.subject": Passive.moreinfo.op("->>")("subject"),
+        "infos.subject_text": Passive.moreinfo.op("->>")("subject_text"),
+        "infos.raw": Passive.moreinfo.op("->>")("raw"),
+        "infos.domaintarget": Passive.moreinfo.op("->>")("domaintarget"),
+        "infos.username": Passive.moreinfo.op("->>")("username"),
+        "infos.password": Passive.moreinfo.op("->>")("password"),
+        "infos.service_name": Passive.moreinfo.op("->>")("service_name"),
+        "infos.service_ostype": Passive.moreinfo.op("->>")("service_ostype"),
+        "infos.service_product": Passive.moreinfo.op("->>")("service_product"),
+        "infos.service_version": Passive.moreinfo.op("->>")("service_version"),
+        "infos.service_extrainfo": Passive.moreinfo.op("->>")("service_extrainfo"),
+        "port": Passive.port,
+        "recontype": Passive.recontype,
+        "source": Passive.source,
+        "targetval": Passive.targetval,
+        "value": Passive.value,
+        "schema_version": Passive.schema_version,
+    }
+
+    base_filter = PassiveFilter
+
+    def count(self, flt):
+        return self._read_one(
+            flt.query(select(func.count()).select_from(flt.select_from))
+        )[0]
+
+    def remove(self, spec_or_id):
+        if not isinstance(spec_or_id, Filter):
+            spec_or_id = self.searchobjectid(spec_or_id)
+        base = spec_or_id.query(
+            select(self.tables.passive.id).select_from(spec_or_id.select_from)
+        ).cte("base")
+        # ``.in_(select(base.c.id))`` instead of ``.in_(base)``:
+        # SA 2.x emits ``SAWarning: Coercing CTE object into a
+        # select() for use in IN()`` when a CTE is passed directly.
+        self._write(
+            delete(self.tables.passive).where(
+                self.tables.passive.id.in_(select(base.c.id))
+            )
+        )
+
+    def _get(self, flt, limit=None, skip=None, sort=None, fields=None):
+        if fields is not None:
+            utils.LOGGER.warning("Argument 'fields' provided but unused")
+        req = flt.query(
+            select(
+                self.tables.passive.id.label("_id"),
+                self.tables.passive.addr,
+                self.tables.passive.sensor,
+                self.tables.passive.count,
+                self.tables.passive.firstseen,
+                self.tables.passive.lastseen,
+                self.tables.passive.port,
+                self.tables.passive.recontype,
+                self.tables.passive.source,
+                self.tables.passive.targetval,
+                self.tables.passive.value,
+                self.tables.passive.info,
+                self.tables.passive.moreinfo,
+                self.tables.passive.schema_version,
+            ).select_from(flt.select_from)
+        )
+        for key, way in sort or []:
+            req = req.order_by(key if way >= 0 else desc(key))
+        if skip is not None:
+            req = req.offset(skip)
+        if limit is not None:
+            req = req.limit(limit)
+        return req
+
+    def get(self, spec, limit=None, skip=None, sort=None, fields=None):
+        """Queries the passive database with the provided filter "spec", and
+        returns a generator.
+
+        """
+        req = self._get(spec, limit=limit, skip=skip, sort=sort, fields=fields)
+        for rec in self._read_iter(req):
+            # ``Row.items()`` was deprecated in 1.4 and removed
+            # in 2.x; ``Row._mapping`` exposes the same dict-style
+            # interface on both major versions.
+            rec = {
+                key: value for key, value in rec._mapping.items() if value is not None
+            }
+            try:
+                rec["addr"] = self.internal2ip(rec["addr"])
+            except (KeyError, ValueError):
+                pass
+            rec["infos"] = dict(rec.pop("info"), **rec.pop("moreinfo"))
+            if rec.get("recontype") in {"SSL_SERVER", "SSL_CLIENT"} and rec.get(
+                "source"
+            ) in {
+                "cert",
+                "cacert",
+            }:
+                for fld in ["not_before", "not_after"]:
+                    try:
+                        rec["infos"][fld] = utils.all2datetime(rec["infos"][fld])
+                    except KeyError:
+                        pass
+            if rec.get("port") == -1:
+                del rec["port"]
+            yield rec
+
+    def get_one(self, flt, skip=None):
+        """Queries the passive database with the provided filter "flt", and
+        returns the first result, or None if no result exists."""
+        return next(self.get(flt, limit=1, skip=skip))
+
+    def _insert_or_update(self, timestamp, values, lastseen=None, replacecount=False):
+        raise NotImplementedError()
+
+    def insert_or_update(
+        self, timestamp, spec, getinfos=None, lastseen=None, replacecount=False
+    ):
+        if spec is None:
+            return
+        try:
+            spec["addr"] = self.ip2internal(spec["addr"])
+        except (KeyError, ValueError):
+            pass
+        if getinfos is not None:
+            spec.update(getinfos(spec))
+            try:
+                spec.update(spec.pop("infos"))
+            except KeyError:
+                pass
+        addr = spec.pop("addr", None)
+        timestamp = utils.all2datetime(timestamp)
+        if lastseen is not None:
+            lastseen = utils.all2datetime(lastseen)
+        if addr:
+            addr = self.ip2internal(addr)
+        if spec["recontype"] in {"SSL_SERVER", "SSL_CLIENT"} and spec["source"] in {
+            "cert",
+            "cacert",
+        }:
+            for fld in ["not_before", "not_after"]:
+                if fld not in spec:
+                    continue
+                if isinstance(spec[fld], datetime.datetime):
+                    spec[fld] = spec[fld].timestamp()
+                elif isinstance(spec[fld], str):
+                    spec[fld] = utils.all2datetime(spec[fld]).timestamp()
+        otherfields = {
+            key: spec.pop(key, "")
+            for key in ["sensor", "source", "targetval", "recontype", "value"]
+        }
+        info = {
+            key: spec.pop(key)
+            for key in ["distance", "signature", "version"]
+            if key in spec
+        }
+        vals = {
+            "addr": addr,
+            # sensor: otherfields
+            "count": spec.pop("count", 1),
+            "firstseen": timestamp,
+            "lastseen": lastseen or timestamp,
+            "port": spec.pop("port", -1),
+            # source, targetval, recontype, value: otherfields
+            "info": info,
+            "moreinfo": spec,
+            "schema_version": spec.pop("schema_version", None),
+        }
+        vals.update(otherfields)
+        self._insert_or_update(
+            timestamp, vals, lastseen=lastseen, replacecount=replacecount
+        )
+
+    def insert_or_update_mix(self, spec, getinfos=None, replacecount=False):
+        """Mix-merge a record into the passive table.  Uses
+        ``firstseen`` / ``lastseen`` / ``count`` carried in the
+        spec rather than synthesising them from a single
+        observation timestamp; on conflict the existing row's
+        ``firstseen`` / ``lastseen`` / ``count`` are merged via
+        ``least`` / ``greatest`` / ``+`` (or replaced wholesale
+        when ``replacecount=True``).
+
+        Useful when copying records from one IVRE database to
+        another, or for the ``_migrate_update_record`` callback
+        that schema migrations route through.
+
+        Mirrors :meth:`MongoDB.insert_or_update_mix`.
+        """
+        if spec is None:
+            return
+        spec = dict(spec)
+        try:
+            spec["addr"] = self.ip2internal(spec["addr"])
+        except (KeyError, ValueError):
+            pass
+        if getinfos is not None and "infos" not in spec:
+            infos = getinfos(spec)
+            if infos:
+                spec["infos"] = infos
+        try:
+            spec.update(spec.pop("infos"))
+        except KeyError:
+            pass
+        addr = spec.pop("addr", None)
+        if addr:
+            addr = self.ip2internal(addr)
+        # ``firstseen`` defaults to ``now()`` for spec dicts that
+        # omit it (matching the regular ``insert_or_update`` path
+        # where the caller has to supply a timestamp).
+        firstseen = utils.all2datetime(spec.pop("firstseen", datetime.datetime.now()))
+        lastseen_raw = spec.pop("lastseen", None)
+        lastseen = (
+            utils.all2datetime(lastseen_raw) if lastseen_raw is not None else firstseen
+        )
+        count_val = spec.pop("count", 1)
+        if spec.get("recontype") in {"SSL_SERVER", "SSL_CLIENT"} and spec.get(
+            "source"
+        ) in {"cert", "cacert"}:
+            for fld in ["not_before", "not_after"]:
+                if fld in spec:
+                    if isinstance(spec[fld], datetime.datetime):
+                        spec[fld] = spec[fld].timestamp()
+                    elif isinstance(spec[fld], str):
+                        spec[fld] = utils.all2datetime(spec[fld]).timestamp()
+        otherfields = {
+            key: spec.pop(key, "")
+            for key in ["sensor", "source", "targetval", "recontype", "value"]
+        }
+        info = {
+            key: spec.pop(key)
+            for key in ["distance", "signature", "version"]
+            if key in spec
+        }
+        vals = {
+            "addr": addr,
+            "count": count_val,
+            "firstseen": firstseen,
+            "lastseen": lastseen,
+            "port": spec.pop("port", -1),
+            "info": info,
+            "moreinfo": spec,
+            "schema_version": spec.pop("schema_version", None),
+        }
+        vals.update(otherfields)
+        self._insert_or_update(
+            firstseen, vals, lastseen=lastseen, replacecount=replacecount
+        )
+
+    def topvalues(
+        self,
+        field,
+        flt=None,
+        topnbr=10,
+        sort=None,
+        limit=None,
+        skip=None,
+        least=False,
+        distinct=True,
+    ):
+        """This method produces top values for a given field.
+
+        If `distinct` is True (default), the top values are computed
+        by distinct events. If it is False, they are computed based on
+        the "count" field.
+
+        """
+        more_filter = None
+
+        def outputproc(val):
+            return val
+
+        if flt is None:
+            flt = PassiveFilter()
+        if field == "domains":
+            flt = self.flt_and(flt, self.searchdns())
+            field = func.jsonb_array_elements(self.tables.passive.moreinfo["domain"])
+        elif field.startswith("domains:"):
+            subfield = field[8:]
+            field = func.jsonb_array_elements_text(
+                self.tables.passive.moreinfo["domain"]
+            ).label("field")
+            if subfield.isdigit():
+                flt = self.flt_and(flt, self.searchdns())
+
+                def more_filter(base):  # noqa: F811
+                    return (
+                        func.length(base.field)
+                        - func.length(func.replace(base.field, ".", ""))
+                        == int(subfield) - 1
+                    )
+
+                # another option would be:
+                # def more_filter(base):
+                #     return base.field.op("~")("^([^\\.]+\\.){%d}[^\\.]+$" %
+                #                               (int(subfield) - 1))
+
+            elif ":" in subfield:
+                subfield, level = subfield.split(":", 1)
+                flt = self.flt_and(flt, self.searchdns(subfield, subdomains=True))
+
+                def more_filter(base):
+                    return base.field.op("~")(
+                        "^([^\\.]+\\.){%d}%s$"
+                        % (int(level) - subfield.count(".") - 1, re.escape(subfield))
+                    )
+
+            else:
+                flt = self.flt_and(flt, self.searchdns(subfield, subdomains=True))
+
+                def more_filter(base):
+                    return base.field.op("~")(f"\\.{re.escape(subfield)}$")
+
+        elif field == "net" or field.startswith("net:"):
+            info = field[4:]
+            info = int(info) if info else 24
+            field = func.set_masklen(sa_text("addr::cidr"), info)
+
+        elif field == "hassh" or (field.startswith("hassh") and field[5] in "-."):
+            if "." in field:
+                field, subfield = field.split(".", 1)
+            else:
+                subfield = "md5"
+            if field == "hassh-server":
+                flt = self.flt_and(flt, self.searchhassh(server=True))
+            elif field == "hassh-client":
+                flt = self.flt_and(flt, self.searchhassh(server=False))
+            elif field == "hassh":
+                flt = self.flt_and(flt, self.searchhassh())
+            else:
+                raise ValueError(f"Unknown field {field}")
+            if subfield == "md5":
+                field = self.tables.passive.value
+            else:
+                field = self.tables.passive.moreinfo[subfield]
+        elif field == "sshkey.bits":
+            flt = self.flt_and(flt, self.searchsshkey())
+
+            def outputproc(val):  # noqa: F811
+                return (
+                    utils.SSH_KEYS.get(
+                        val[0],
+                        (val[0][4:] if val[0][:4] == "ssh-" else val[0]).upper(),
+                    ),
+                    val[1],
+                )
+
+            field = [
+                self.tables.passive.moreinfo["algo"],
+                self.tables.passive.moreinfo["bits"],
+            ]
+        elif field == "sshkey.keytype":
+            flt = self.flt_and(flt, self.searchsshkey())
+
+            def outputproc(val):
+                return utils.SSH_KEYS.get(
+                    val,
+                    (val[4:] if val[:4] == "ssh-" else val).upper(),
+                )
+
+            field = self.tables.passive.moreinfo["algo"]
+        elif field.startswith("sshkey."):
+            flt = self.flt_and(flt, self.searchsshkey())
+            subfield = field[7:]
+            field = {
+                "fingerprint": self.tables.passive.moreinfo["md5"],
+                "key": self.tables.passive.value,
+            }.get(subfield, self.tables.passive.moreinfo[subfield])
+        elif field == "useragent" or field.startswith("useragent:"):
+            if field == "useragent":
+                flt = self.flt_and(flt, self.searchuseragent())
+            else:
+                flt = self.flt_and(
+                    flt, self.searchuseragent(useragent=utils.str2regexp(field[10:]))
+                )
+            field = self.tables.passive.value
+
+        if not isinstance(field, list):
+            field = [field]
+
+        for i, fld in enumerate(field):
+            if isinstance(fld, str):
+                field[i] = self.fields[fld]
+        if field == [self.fields["addr"]]:
+            outputproc = self.internal2ip  # noqa: F811
+
+        order = "count" if least else desc("count")
+        if more_filter is None:
+            req = flt.query(
+                select(
+                    (
+                        func.count()
+                        if distinct
+                        else func.sum(self.tables.passive.count)
+                    ).label("count"),
+                    *field,
+                )
+                .select_from(flt.select_from)
+                .group_by(*field)
+            )
+        else:
+            base1 = flt.query(
+                select(
+                    (
+                        func.count()
+                        if distinct
+                        else func.sum(self.tables.passive.count)
+                    ).label("count"),
+                    *field,
+                )
+                .select_from(flt.select_from)
+                .group_by(*field)
+            ).cte("base1")
+            req = select(
+                base1.c.count,
+                *(getattr(base1.c, fld.name) for fld in field),
+            ).where(more_filter(base1.c))
+        return (
+            {
+                "count": result[0],
+                "_id": outputproc(result[1:] if len(result) > 2 else result[1]),
+            }
+            for result in self._read_iter(req.order_by(order).limit(topnbr))
+        )
+
+    def _features_port_list(self, flt, yieldall, use_service, use_product, use_version):
+        flt = self.flt_and(flt, self.searchport(-1, neg=True))
+        if use_version:
+            fields = [
+                self.tables.passive.port,
+                self.tables.passive.moreinfo.op("->>")("service_name"),
+                self.tables.passive.moreinfo.op("->>")("service_product"),
+                self.tables.passive.moreinfo.op("->>")("service_version"),
+            ]
+        elif use_product:
+            fields = [
+                self.tables.passive.port,
+                self.tables.passive.moreinfo.op("->>")("service_name"),
+                self.tables.passive.moreinfo.op("->>")("service_product"),
+            ]
+        elif use_service:
+            fields = [
+                self.tables.passive.port,
+                self.tables.passive.moreinfo.op("->>")("service_name"),
+            ]
+        else:
+            fields = [self.tables.passive.port]
+        req = flt.query(select(*fields).group_by(*fields))
+        if not yieldall:
+            req = req.order_by(*(nulls_first(fld) for fld in fields))
+            return self._read_iter(req)
+        # results will be modified, we cannot keep a RowProxy
+        # instance, so we convert the results to lists
+        return (list(rec) for rec in self._read_iter(req))
+
+    @classmethod
+    def searchnonexistent(cls):
+        return PassiveFilter(main=False)
+
+    @classmethod
+    def _searchobjectid(cls, oid, neg=False):
+        if len(oid) == 1:
+            return PassiveFilter(
+                main=(
+                    (cls.tables.passive.id != oid[0])
+                    if neg
+                    else (cls.tables.passive.id == oid[0])
+                )
+            )
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.id.notin_(oid[0]))
+                if neg
+                else (cls.tables.passive.id.in_(oid[0]))
+            )
+        )
+
+    @classmethod
+    def searchcmp(cls, key, val, cmpop):
+        if isinstance(key, str):
+            key = cls.fields[key]
+        return PassiveFilter(main=key.op(cmpop)(val))
+
+    @classmethod
+    def searchval(cls, key, val):
+        if isinstance(key, str):
+            key = cls.fields[key]
+        if isinstance(val, re.Pattern):
+            return PassiveFilter(
+                main=key.op("~*" if (val.flags & re.IGNORECASE) else "~")(val.pattern)
+            )
+        return cls.searchcmp(key, val, "=")
+
+    @classmethod
+    def searchhost(cls, addr, neg=False):
+        """Filters (if `neg` == True, filters out) one particular host
+        (IP address).
+
+        """
+        addr = cls.ip2internal(addr)
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.addr != addr)
+                if neg
+                else (cls.tables.passive.addr == addr)
+            ),
+        )
+
+    @classmethod
+    def searchhosts(cls, hosts, neg=False):
+        hosts = [cls.ip2internal(host) for host in hosts]
+        return PassiveFilter(
+            main=(
+                cls.tables.passive.addr.notin_(hosts)
+                if neg
+                else cls.tables.passive.addr.in_(hosts)
+            ),
+        )
+
+    @classmethod
+    def searchrange(cls, start, stop, neg=False):
+        start, stop = cls.ip2internal(start), cls.ip2internal(stop)
+        if neg:
+            return PassiveFilter(
+                main=or_(
+                    cls.tables.passive.addr < start, cls.tables.passive.addr > stop
+                )
+            )
+        return PassiveFilter(
+            main=and_(cls.tables.passive.addr >= start, cls.tables.passive.addr <= stop)
+        )
+
+    @classmethod
+    def searchranges(cls, ranges, neg=False):
+        """Filters (if `neg` == True, filters out) some IP address ranges.
+
+        `ranges` is an instance of ivre.geoiputils.IPRanges().
+
+        """
+        flt = []
+        for start, stop in ranges.iter_ranges():
+            start, stop = cls.ip2internal(start), cls.ip2internal(stop)
+            flt.append(
+                (or_ if neg else and_)(
+                    cls.tables.passive.addr >= start, cls.tables.passive.addr <= stop
+                )
+            )
+        if flt:
+            return PassiveFilter(main=(and_ if neg else or_)(*flt))
+        return cls.flt_empty if neg else cls.searchnonexistent()
+
+    @classmethod
+    def _passive_field_clause(cls, column_, value):
+        """Build a positive (non-negated) SQLAlchemy clause for a
+        passive-table column given a list or scalar value."""
+        if isinstance(value, list):
+            return column_.in_(value)
+        return cls._searchstring_re(column_, value, neg=False)
+
+    @classmethod
+    def searchrecontype(cls, rectype=None, source=None, neg=False):
+        """Filter (or filter out) passive records on the
+        ``(recontype, source)`` field pair. See
+        :meth:`ivre.db.DBPassive.searchrecontype`. SQL mirror of
+        the MongoDB implementation; both fields share the same
+        scalar / list / regex acceptance and conjunction-negation
+        semantics.
+        """
+        clauses = []
+        if rectype is not None:
+            clauses.append(
+                cls._passive_field_clause(cls.tables.passive.recontype, rectype)
+            )
+        if source is not None:
+            clauses.append(cls._passive_field_clause(cls.tables.passive.source, source))
+        if not clauses:
+            # Degenerate call. Match-all positive, match-none negative.
+            return cls.flt_empty if not neg else cls.searchnonexistent()
+        combined = and_(*clauses) if len(clauses) > 1 else clauses[0]
+        return PassiveFilter(main=not_(combined) if neg else combined)
+
+    @classmethod
+    def searchsource(cls, src, neg=False):
+        """Inherited contract from ``DB`` but overridden for
+        passive: a passive record's ``source`` is meaningful only
+        relative to its ``recontype``, so the search path is
+        unified through :meth:`searchrecontype`."""
+        return cls.searchrecontype(source=src, neg=neg)
+
+    @classmethod
+    def searchdns(
+        cls, name=None, reverse=False, dnstype=None, subdomains=False, neg=False
+    ):
+        if name is not None:
+            if isinstance(name, list):
+                if len(name) == 1:
+                    name = name[0]
+                else:
+                    # ``neg`` distributes over the alternatives:
+                    # exclude all ``name`` values → require none
+                    # of them to match (logical AND of negations).
+                    combine = cls.flt_and if neg else cls.flt_or
+                    return combine(
+                        *(
+                            cls._searchdns(
+                                name=domain,
+                                reverse=reverse,
+                                dnstype=dnstype,
+                                subdomains=subdomains,
+                                neg=neg,
+                            )
+                            for domain in name
+                        )
+                    )
+        return cls._searchdns(
+            name=name,
+            reverse=reverse,
+            dnstype=dnstype,
+            subdomains=subdomains,
+            neg=neg,
+        )
+
+    @classmethod
+    def _searchdns(
+        cls, name=None, reverse=False, dnstype=None, subdomains=False, neg=False
+    ):
+        cnd = cls.tables.passive.recontype == "DNS_ANSWER"
+        if name is not None:
+            name_cnd = (
+                (
+                    cls.tables.passive.moreinfo[
+                        "domaintarget" if reverse else "domain"
+                    ].has_key(  # noqa: W601
+                        name
+                    )
+                )
+                if subdomains
+                else cls._searchstring_re(
+                    (
+                        cls.tables.passive.targetval
+                        if reverse
+                        else cls.tables.passive.value
+                    ),
+                    name,
+                )
+            )
+            cnd &= not_(name_cnd) if neg else name_cnd
+        if dnstype is not None:
+            cnd &= cls.tables.passive.source.op("~")(f"^{dnstype.upper()}-")
+        return PassiveFilter(main=cnd)
+
+    @classmethod
+    def searchmac(cls, mac=None, neg=False):
+        if mac is None:
+            if neg:
+                return PassiveFilter(main=cls.tables.passive.recontype != "MAC_ADDRESS")
+            return PassiveFilter(main=cls.tables.passive.recontype == "MAC_ADDRESS")
+        value = cls.tables.passive.value
+        if isinstance(mac, re.Pattern):
+            cnd = value.op("~*")(mac.pattern)
+            if neg:
+                cnd = not_(cnd)
+        elif neg:
+            cnd = value != mac
+        else:
+            cnd = value == mac
+        return PassiveFilter(main=(cls.tables.passive.recontype == "MAC_ADDRESS") & cnd)
+
+    @classmethod
+    def searchuseragent(cls, useragent=None, neg=False):
+        if neg:
+            raise ValueError(
+                "searchuseragent([...], neg=True) is not supported in passive DB."
+            )
+        if useragent is None:
+            return PassiveFilter(
+                main=(
+                    (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER")
+                    & (cls.tables.passive.source == "USER-AGENT")
+                )
+            )
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER")
+                & (cls.tables.passive.source == "USER-AGENT")
+                & (cls._searchstring_re(cls.tables.passive.value, useragent))
+            )
+        )
+
+    @classmethod
+    def searchftpauth(cls):
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.recontype == "FTP_CLIENT")
+                | (cls.tables.passive.recontype == "FTP_SERVER")
+            )
+        )
+
+    @classmethod
+    def searchpopauth(cls):
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.recontype == "POP_CLIENT")
+                | (cls.tables.passive.recontype == "POP_SERVER")
+            )
+        )
+
+    @classmethod
+    def searchbasicauth(cls):
+        return PassiveFilter(
+            main=(
+                (
+                    (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER")
+                    | (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER_SERVER")
+                )
+                & (
+                    (cls.tables.passive.source == "AUTHORIZATION")
+                    | (cls.tables.passive.source == "PROXY-AUTHORIZATION")
+                )
+                & cls.tables.passive.value.op("~*")("^Basic")
+            )
+        )
+
+    @classmethod
+    def searchhttpauth(cls):
+        return PassiveFilter(
+            main=(
+                (
+                    (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER")
+                    | (cls.tables.passive.recontype == "HTTP_CLIENT_HEADER_SERVER")
+                )
+                & (
+                    (cls.tables.passive.source == "AUTHORIZATION")
+                    | (cls.tables.passive.source == "PROXY-AUTHORIZATION")
+                )
+            )
+        )
+
+    @classmethod
+    def searchcert(
+        cls,
+        keytype=None,
+        md5=None,
+        sha1=None,
+        sha256=None,
+        subject=None,
+        issuer=None,
+        self_signed=None,
+        pkmd5=None,
+        pksha1=None,
+        pksha256=None,
+        cacert=False,
+    ):
+        return PassiveFilter(
+            main=(cls.tables.passive.recontype == "SSL_SERVER")
+            & (cls.tables.passive.source == ("cacert" if cacert else "cert"))
+            & (
+                cls._searchcert(
+                    cls.tables.passive.moreinfo,
+                    keytype=keytype,
+                    md5=md5,
+                    sha1=sha1,
+                    sha256=sha256,
+                    subject=subject,
+                    issuer=issuer,
+                    self_signed=self_signed,
+                    pkmd5=pkmd5,
+                    pksha1=pksha1,
+                    pksha256=pksha256,
+                )
+            )
+        )
+
+    @classmethod
+    def _searchja3(cls, value_or_hash=None):
+        if not value_or_hash:
+            return True
+        key, value = cls._ja3keyvalue(value_or_hash)
+        try:
+            return {
+                "md5": cls.tables.passive.value,
+                "sha1": cls.tables.passive.moreinfo.op("->>")("sha1"),
+                "sha256": cls.tables.passive.moreinfo.op("->>")("sha256"),
+            }[key] == value
+        except KeyError:
+            return cls._searchstring_re(
+                cls.tables.passive.moreinfo.op("->>")("raw"),
+                value,
+            )
+
+    @classmethod
+    def searchja3client(cls, value_or_hash=None):
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.recontype == "SSL_CLIENT")
+                & (cls.tables.passive.source == "ja3")
+                & cls._searchja3(value_or_hash)
+            )
+        )
+
+    @classmethod
+    def searchja3server(cls, value_or_hash=None, client_value_or_hash=None):
+        base = (cls.tables.passive.recontype == "SSL_SERVER") & cls._searchja3(
+            value_or_hash
+        )
+        if not client_value_or_hash:
+            return PassiveFilter(
+                main=(base & cls.tables.passive.source.op("~")("^ja3-"))
+            )
+        key, value = cls._ja3keyvalue(client_value_or_hash)
+        if key == "md5":
+            return PassiveFilter(
+                main=(base & (cls.tables.passive.source == f"ja3-{value}"))
+            )
+        base &= cls.tables.passive.source.op("~")("^ja3-")
+        if key in ["sha1", "sha256"]:
+            return PassiveFilter(
+                main=(
+                    base
+                    & (
+                        cls.tables.passive.moreinfo.op("->")("client").op("->>")(key)
+                        == value
+                    )
+                )
+            )
+        return PassiveFilter(
+            main=(
+                base
+                & cls._searchstring_re(
+                    cls.tables.passive.moreinfo.op("->")("client").op("->>")("raw"),
+                    value,
+                )
+            )
+        )
+
+    @classmethod
+    def searchja4client(
+        cls,
+        value=None,
+        raw=None,
+        ja4_a=None,
+        ja4_b=None,
+        ja4_c=None,
+        ja4_b_raw=None,
+        ja4_c_raw=None,
+        ja4_c1_raw=None,
+        ja4_c2_raw=None,
+        neg=False,
+    ):
+        """SQL passive equivalent of
+        :meth:`MongoDBPassive.searchja4client`.
+
+        Filters the passive store for JA4 client fingerprint records
+        (``recontype == "SSL_CLIENT"``, ``source == "ja4"``). Each
+        component is matched against the relevant
+        ``moreinfo`` JSONB key:
+
+          - ``value`` matches ``passive.value`` directly. If passed
+            as a string in the canonical
+            ``ja4_a_ja4_b_ja4_c`` form, the indexed components
+            are also extracted and constrained.
+          - ``raw`` is split into ``ja4_a`` /
+            ``ja4_b_raw`` / ``ja4_c1_raw`` /
+            ``ja4_c2_raw`` along the same scheme.
+          - The individual ``ja4_*`` parameters bypass parsing
+            and constrain a single JSON key each.
+
+        ``neg=True`` wraps the whole condition in ``not_(...)``.
+        """
+        base = (cls.tables.passive.recontype == "SSL_CLIENT") & (
+            cls.tables.passive.source == "ja4"
+        )
+        if value is not None:
+            base &= cls.tables.passive.value == value
+            # Also constrain the indexed ja4_* components when
+            # ``value`` is the canonical 10-char-prefix form.
+            # ``isinstance(value, str)`` mirrors the Mongo guard
+            # (``MongoDBPassive.searchja4client`` at
+            # ``mongo.py:5672``); a regex / list value is left
+            # to the equality check above.
+            if isinstance(value, str):
+                try:
+                    if value[10] != "_":
+                        raise ValueError()
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_a") == value[:10]
+                    v_b, v_c = value[11:].split("_", 1)
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_b") == v_b
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_c") == v_c
+                except (KeyError, ValueError, IndexError):
+                    utils.LOGGER.warning("Invalid JA4 value %r", value, exc_info=True)
+        if raw is not None:
+            try:
+                if raw[10] != "_":
+                    raise ValueError()
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_a") == raw[:10]
+                # Split ``raw[11:]`` into ``ja4_b_raw`` and
+                # ``ja4_c_raw``; ``ja4_c_raw`` may further split
+                # into ``ja4_c1_raw`` / ``ja4_c2_raw``.
+                r_b, r_c_raw = raw[11:].split("_", 1)
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_b_raw") == r_b
+                if "_" in r_c_raw:
+                    c1, c2 = r_c_raw.split("_", 1)
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_c1_raw") == c1
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_c2_raw") == c2
+                else:
+                    base &= (
+                        cls.tables.passive.moreinfo.op("->>")("ja4_c1_raw") == r_c_raw
+                    )
+                    # ``== ""`` builds a SQL ``= ''`` clause, not
+                    # a Python boolean check; disable pylint's
+                    # implicit-booleaness suggestion (would invert
+                    # the SA BinaryExpression's polarity). The
+                    # disable goes on the line where the
+                    # comparison's left operand sits, which is
+                    # where pylint attributes the message.
+                    # pylint: disable-next=use-implicit-booleaness-not-comparison-to-string
+                    base &= cls.tables.passive.moreinfo.op("->>")("ja4_c2_raw") == ""
+            except (KeyError, ValueError, IndexError):
+                utils.LOGGER.warning("Invalid JA4 raw value %r", raw, exc_info=True)
+        if ja4_a is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_a") == ja4_a
+        if ja4_b is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_b") == ja4_b
+        if ja4_c is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_c") == ja4_c
+        if ja4_b_raw is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_b_raw") == ja4_b_raw
+        if ja4_c_raw is not None:
+            if "_" in ja4_c_raw:
+                c1, c2 = ja4_c_raw.split("_", 1)
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_c1_raw") == c1
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_c2_raw") == c2
+            else:
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_c1_raw") == ja4_c_raw
+                # ``== ""`` builds a SQL ``= ''`` clause; see the
+                # comment above the matching line in the ``raw``
+                # branch for why pylint's implicit-booleaness
+                # suggestion is wrong here.
+                # pylint: disable-next=use-implicit-booleaness-not-comparison-to-string
+                base &= cls.tables.passive.moreinfo.op("->>")("ja4_c2_raw") == ""
+        if ja4_c1_raw is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_c1_raw") == ja4_c1_raw
+        if ja4_c2_raw is not None:
+            base &= cls.tables.passive.moreinfo.op("->>")("ja4_c2_raw") == ja4_c2_raw
+        return PassiveFilter(main=not_(base) if neg else base)
+
+    @classmethod
+    def searchsshkey(cls, fingerprint=None, key=None, keytype=None, bits=None):
+        cnd = (cls.tables.passive.recontype == "SSH_SERVER_HOSTKEY") & (
+            cls.tables.passive.source == "SSHv2"
+        )
+        if fingerprint is not None:
+            if not isinstance(fingerprint, re.Pattern):
+                fingerprint = fingerprint.replace(":", "").lower()
+            cnd &= cls._searchstring_re(
+                cls.tables.passive.moreinfo.op("->>")("md5"), fingerprint
+            )
+        if key is not None:
+            cnd &= cls._searchstring_re(cls.tables.passive.value, key)
+        if keytype is not None:
+            cnd &= cls.tables.passive.moreinfo.op("->>")("algo") == f"ssh-{keytype}"
+        if bits is not None:
+            cnd &= cls.tables.passive.moreinfo.op("->>")("bits") == bits
+        return PassiveFilter(main=cnd)
+
+    @classmethod
+    def searchtcpsrvbanner(cls, banner):
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.recontype == "TCP_SERVER_BANNER")
+                & (cls._searchstring_re(cls.tables.passive.value, banner))
+            )
+        )
+
+    @classmethod
+    def searchsensor(cls, sensor, neg=False):
+        return PassiveFilter(
+            main=(cls._searchstring_re(cls.tables.passive.sensor, sensor, neg=neg)),
+        )
+
+    @classmethod
+    def searchport(cls, port, protocol="tcp", state="open", neg=False):
+        """Filters (if `neg` == True, filters out) records on the specified
+        protocol/port.
+
+        """
+        if protocol != "tcp":
+            raise ValueError("Protocols other than TCP are not supported in passive")
+        if state != "open":
+            raise ValueError("Only open ports can be found in passive")
+        return PassiveFilter(
+            main=(
+                (cls.tables.passive.port != port)
+                if neg
+                else (cls.tables.passive.port == port)
+            )
+        )
+
+    @classmethod
+    def searchservice(cls, srv, port=None, protocol=None):
+        """Search a port with a particular service."""
+        if srv is False:
+            flt = [~cls.tables.passive.moreinfo.op("?")("service_name")]
+        elif isinstance(srv, list):
+            flt = [cls.tables.passive.moreinfo.op("->>")("service_name").in_(srv)]
+        else:
+            flt = [
+                cls._searchstring_re(
+                    cls.tables.passive.moreinfo.op("->>")("service_name"), srv
+                )
+            ]
+        if port is not None:
+            flt.append(cls.tables.passive.port == port)
+        if protocol is not None and protocol != "tcp":
+            raise ValueError("Protocols other than TCP are not supported in passive")
+        return PassiveFilter(main=and_(*flt))
+
+    @classmethod
+    def searchproduct(
+        cls, product=None, version=None, service=None, port=None, protocol=None
+    ):
+        """Search a port with a particular `product`. It is (much)
+        better to provide the `service` name and/or `port` number
+        since those fields are indexed.
+
+        """
+        flt = []
+        if product is not None:
+            if product is False:
+                flt.append(~cls.tables.passive.moreinfo.op("?")("service_product"))
+            elif isinstance(product, list):
+                flt.append(
+                    cls.tables.passive.moreinfo.op("->>")("service_product").in_(
+                        product
+                    )
+                )
+            else:
+                flt.append(
+                    cls._searchstring_re(
+                        cls.tables.passive.moreinfo.op("->>")("service_product"),
+                        product,
+                    )
+                )
+        if version is not None:
+            if version is False:
+                flt.append(~cls.tables.passive.moreinfo.op("?")("service_version"))
+            elif isinstance(version, list):
+                flt.append(
+                    cls.tables.passive.moreinfo.op("->>")("service_version").in_(
+                        version
+                    )
+                )
+            else:
+                flt.append(
+                    cls._searchstring_re(
+                        cls.tables.passive.moreinfo.op("->>")("service_version"),
+                        version,
+                    )
+                )
+        if service is not None:
+            if service is False:
+                flt.append(~cls.tables.passive.moreinfo.op("?")("service_name"))
+            elif isinstance(service, list):
+                flt.append(
+                    cls.tables.passive.moreinfo.op("->>")("service_name").in_(service)
+                )
+            else:
+                flt.append(
+                    cls._searchstring_re(
+                        cls.tables.passive.moreinfo.op("->>")("service_name"),
+                        service,
+                    )
+                )
+        if port is not None:
+            flt.append(cls.tables.passive.port == port)
+        if protocol is not None:
+            if protocol != "tcp":
+                raise ValueError(
+                    "Protocols other than TCP are not supported in passive"
+                )
+        return PassiveFilter(main=and_(*flt))
+
+    @classmethod
+    def searchsvchostname(cls, hostname):
+        return PassiveFilter(
+            main=cls._searchstring_re(
+                cls.tables.passive.moreinfo.op("->>")("service_hostname"),
+                hostname,
+            )
+        )
+
+    @classmethod
+    def searchtimeago(cls, delta, neg=False, new=True):
+        field = cls.tables.passive.firstseen if new else cls.tables.passive.lastseen
+        if not isinstance(delta, datetime.timedelta):
+            delta = datetime.timedelta(seconds=delta)
+        now = datetime.datetime.now()
+        timestamp = now - delta
+        return PassiveFilter(main=(field < timestamp if neg else field >= timestamp))
+
+    @classmethod
+    def searchnewer(cls, timestamp, neg=False, new=True):
+        field = cls.tables.passive.firstseen if new else cls.tables.passive.lastseen
+        timestamp = utils.all2datetime(timestamp)
+        return PassiveFilter(main=(field <= timestamp if neg else field > timestamp))
+
+
+# ---------------------------------------------------------------------
+# SQLDBRir -- shared base for the SQL backends' RIR (Regional
+# Internet Registry whois) data category.  The schema (declared in
+# :class:`~ivre.db.sql.tables.Rir`) mirrors :class:`MongoDBRir`'s
+# wire shape: each row is one ``inetnum`` / ``inet6num`` /
+# ``aut-num`` whois block, with the IP range stored as native
+# ``INET`` columns instead of Mongo's ``(start_0, start_1)`` /
+# ``(stop_0, stop_1)`` int128 split (PostgreSQL handles range
+# comparisons on ``INET`` natively).
+#
+# The text columns (``netname`` / ``descr`` / ``remarks`` /
+# ``notify`` / ``org`` / ``as_name``) are surfaced as filterable
+# columns; everything else lands in the ``extra`` JSONB bag for
+# forward compatibility with new RIR attributes.
+# ---------------------------------------------------------------------
+
+
+# Keys the RIR parser :meth:`DBRir.gen_records` emits that map to
+# typed columns.  Anything outside this set lands in
+# :attr:`Rir.extra` (JSONB) so a new RIR field doesn't need a
+# schema migration.  The leading-key set must match
+# :data:`MongoDBRir.text_fields` plus the structural fields
+# :meth:`DBRir.import_files` synthesises (``start`` / ``stop`` /
+# ``aut-num`` / ``source_file`` / ``source_hash``).
+_RIR_TYPED_COLUMNS: dict[str, str] = {
+    "start": "start",
+    "stop": "stop",
+    "aut-num": "aut_num",
+    "as-name": "as_name",
+    "netname": "netname",
+    "descr": "descr",
+    "remarks": "remarks",
+    "notify": "notify",
+    "org": "org",
+    "country": "country",
+    "lang": "lang",
+    "source": "source",
+    "source_file": "source_file",
+    "source_hash": "source_hash",
+}
+
+# Reverse mapping for :meth:`SQLDBRir._row2rec`.
+_RIR_TYPED_COLUMNS_INVERSE: dict[str, str] = {
+    v: k for k, v in _RIR_TYPED_COLUMNS.items()
+}
+
+
+class SQLDBRir(SQLDB, DBRir):
+    """SQL-backend base for the RIR data category.
+
+    Concrete dialects subclass this together with the dialect's
+    ``SQLDB`` flavour (e.g. :class:`PostgresDB`) -- see
+    :class:`~ivre.db.sql.postgres.PostgresDBRir`.
+    """
+
+    table_layout = namedtuple("rir_layout", ["rir"])
+    tables = table_layout(Rir)
+
+    # Bound to :data:`MongoDBRir.schema_latest_versions` so a
+    # mixed PG / Mongo deployment shares the same migration
+    # generation marker.  Bumped via
+    # ``_migrate_schema_NN_MM`` on PG when the wire shape changes
+    # (the SQL backend has no records pre-dating this PR, so no
+    # historical migration is required at this point).
+    SCHEMA_VERSION = 2
+
+    @classmethod
+    def searchhost(cls, addr, neg=False):
+        """Filter rows whose IP range covers ``addr``.
+
+        Uses native ``INET`` ordering (``start <= addr <= stop``);
+        the ``rir_idx_range`` B-tree accelerates the lookup on
+        same-family ranges.  ``neg=True`` is rejected to mirror
+        :meth:`MongoDBRir.searchhost`.
+
+        ``addr`` is bound as a plain string; the
+        :class:`~ivre.db.sql.tables.INETLiteral` column type's
+        ``bind_expression`` wraps the value in ``CAST(? AS
+        INET)`` so PostgreSQL coerces the literal at execution
+        time -- no explicit cast needed at the call site.
+        """
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        return and_(cls.tables.rir.start <= addr, cls.tables.rir.stop >= addr)
+
+    @classmethod
+    def searchnet(cls, net, neg=False):
+        """Filter rows whose ``(start, stop)`` range overlaps
+        with ``net``.
+
+        Mirrors :meth:`MongoDBRir.searchnet`: any kind of
+        overlap matches (record fully contains ``net``, record
+        fully contained in ``net``, partial overlap on either
+        side).  ``neg=True`` is unsupported (mirrors
+        :meth:`searchhost`).
+        """
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        net_start, net_stop = utils.net2range(net)
+        return cls._searchrange_overlap(net_start, net_stop)
+
+    @classmethod
+    def searchrange(cls, start, stop, neg=False):
+        """Filter rows whose ``(start, stop)`` range overlaps
+        with the ``[start, stop]`` window.
+
+        Same overlap semantics as :meth:`searchnet`.  ``neg=True``
+        is unsupported.
+        """
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        return cls._searchrange_overlap(start, stop)
+
+    @classmethod
+    def _searchrange_overlap(cls, win_start, win_stop):
+        """Return the SA expression for ``record.start <=
+        win_stop AND record.stop >= win_start``.
+
+        Mirrors :meth:`MongoDBRir._searchrange_overlap` byte-for-
+        byte; the single B-tree :data:`rir_idx_range` covers both
+        comparisons.  ``win_start`` / ``win_stop`` are bound as
+        plain strings; the column's ``INETLiteral`` bind
+        expression wraps each value in ``CAST(? AS INET)`` so
+        PostgreSQL handles the cast at execution time.
+        """
+        return and_(
+            cls.tables.rir.start <= win_stop,
+            cls.tables.rir.stop >= win_start,
+        )
+
+    @classmethod
+    def searchasnum(cls, asnum, neg=False):
+        """Filter ``aut-num`` records by integer AS number.
+
+        Accepts an int, a string (``"AS1234"`` / ``"1234"``), or
+        a list of either (mirrors
+        :meth:`MongoDBRir.searchasnum`'s shape).  Strings are
+        coerced to int via :func:`_coerce_asnum_sql`.
+        """
+        return cls._search_field(
+            cls.tables.rir.aut_num,
+            asnum,
+            neg=neg,
+            map_=_coerce_asnum_sql,
+        )
+
+    @classmethod
+    def searchasname(cls, name, neg=False):
+        """Filter ``aut-num`` records by their ``as-name`` text
+        field.  Accepts a string, a list, or a regex.
+        """
+        return cls._search_field(cls.tables.rir.as_name, name, neg=neg)
+
+    @classmethod
+    def searchcountry(cls, country, neg=False):
+        """Filter rows by two-letter country code(s)."""
+        return cls._search_field(
+            cls.tables.rir.country,
+            utils.country_unalias(country),
+            neg=neg,
+        )
+
+    @classmethod
+    def searchsourcefile(cls, src, neg=False):
+        """Filter rows by the basename of the imported RIR
+        database file (``ripe.db.inetnum.gz`` etc.).
+        """
+        return cls._search_field(cls.tables.rir.source_file, src, neg=neg)
+
+    @classmethod
+    def searchfileid(cls, fileid, neg=False):
+        """Filter rows by the SHA-256 hex digest of the imported
+        RIR database file.
+        """
+        return cls._search_field(cls.tables.rir.source_hash, fileid, neg=neg)
+
+    @classmethod
+    def searchtext(cls, text, neg=False):
+        """Filter RIR records whose concatenated text columns
+        (``netname``, ``descr``, ``remarks``, ``notify``,
+        ``org``, ``as_name``) match ``text``.
+
+        Mirrors the contract of :meth:`MongoDBRir.searchtext`,
+        which composes a ``$text`` query against the text index
+        over :attr:`DBRir.text_fields`.  On PostgreSQL the
+        dispatch goes through the ``rir_idx_fts`` GIN index
+        declared in :mod:`ivre.db.sql.tables` (using the same
+        ``to_tsvector('english', coalesce(...))`` expression
+        :func:`tables._fts_concat` builds for both sides) so the
+        planner can substitute the index for the ``WHERE ... @@
+        plainto_tsquery(...)`` clause.
+
+        DuckDB has no ``to_tsvector`` operator and overrides
+        this helper in :class:`~ivre.db.sql.duckdb.DuckDBRir` to
+        dispatch through the FTS extension's
+        ``fts_main_rir.match_bm25`` function instead.
+
+        With ``neg=True`` the predicate is inverted: records
+        whose entire text surface is unrelated to ``text``.
+        """
+        expr = tables_module._fts_concat("rir", RIR_FTS_COLUMNS)
+        flt = expr.op("@@")(func.plainto_tsquery("english", text))
+        if neg:
+            return not_(flt)
+        return flt
+
+    @staticmethod
+    def flt_and(*args):
+        """Combine filter expressions via SQL ``AND``.
+
+        ``None`` arguments are dropped so callers can chain
+        optional filters (``flt_and(searchhost(addr), spec)``
+        with ``spec`` possibly ``None`` is the common shape).
+        """
+        clauses = [a for a in args if a is not None]
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return and_(*clauses)
+
+    @staticmethod
+    def flt_or(*args):
+        """Combine filter expressions via SQL ``OR``."""
+        clauses = [a for a in args if a is not None]
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return or_(*clauses)
+
+    flt_empty = None
+
+    def remove_many(self, flt):
+        """Delete every row matching ``flt``.
+
+        Mirrors :meth:`MongoDBRir.remove_many` -- used by the
+        idempotent re-import path
+        (:meth:`DBRir.import_files`) to drop the prior
+        generation of records sourced from the same file.
+        """
+        with self.db.begin() as conn:
+            conn.execute(
+                delete(self.tables.rir).where(flt if flt is not None else true())
+            )
+
+    @classmethod
+    def _row2rec(cls, row):
+        """Project a :class:`Rir` row into the dict shape the
+        Mongo path returns (so ``rirlookup`` /
+        :meth:`DBRir.import_files` consumers see one shape on
+        either backend).
+
+        ``aut_num`` / ``as_name`` are renamed back to the
+        whois-native ``aut-num`` / ``as-name`` keys; values from
+        the ``extra`` JSONB bag are flattened into the top-level
+        dict.  ``size`` round-trips as :class:`Decimal` (matches
+        Mongo's ``Decimal128`` shape after the JSON decode).
+        ``start`` / ``stop`` are coerced through
+        :meth:`SQLDB.internal2ip` so the DuckDB backend
+        (where ``INET`` round-trips as a ``{'ip_type',
+        'address', 'mask'}`` dict struct rather than a
+        printable string) yields the same wire shape PG does.
+        """
+        rec = {}
+        for col_name, key in _RIR_TYPED_COLUMNS_INVERSE.items():
+            value = getattr(row, col_name)
+            if value is None:
+                continue
+            if col_name in ("start", "stop"):
+                value = cls.internal2ip(value)
+            rec[key] = value
+        if row.size is not None:
+            rec["size"] = row.size
+        if row.schema_version is not None:
+            rec["schema_version"] = row.schema_version
+        if row.extra:
+            for key, value in row.extra.items():
+                rec.setdefault(key, value)
+        rec["_id"] = row.id
+        return rec
+
+    def get(self, spec, limit=None, skip=None, sort=None, fields=None):
+        """Iterate rows matching ``spec`` (a SA expression
+        returned by one of the ``searchXXX`` helpers, or
+        ``None`` for the match-all case).
+
+        Mirrors :meth:`MongoDBRir.get`'s contract: each yielded
+        record is a dict with the same key shape Mongo
+        produces.  ``fields`` is accepted for API compatibility
+        with the abstract :meth:`DB.get` signature but ignored
+        here -- the projection is cheap (one row, one table)
+        and the ``rirlookup`` consumer expects every column
+        anyway.
+        """
+        del fields  # unused; signature parity with DB.get
+        # ``select(self.tables.rir)`` expands to every column on
+        # the table (Core form), so each yielded row is a
+        # :class:`sqlalchemy.engine.Row` with column attribute
+        # access -- pass it straight to :meth:`_row2rec`.
+        stmt = select(self.tables.rir)
+        if spec is not None:
+            stmt = stmt.where(spec)
+        for col in self._sort_to_sa(sort):
+            stmt = stmt.order_by(col)
+        if skip is not None:
+            stmt = stmt.offset(skip)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                yield self._row2rec(row)
+
+    def _sort_to_sa(self, sort):
+        """Translate a Mongo-shaped ``sort=[(field, dir), ...]``
+        list into SA ``order_by`` columns.
+
+        ``dir`` is ``-1`` for descending, anything else for
+        ascending (matches PyMongo).  Unknown field names raise
+        ``ValueError`` so a caller drift surfaces here, not on
+        the live DB lane.
+        """
+        if not sort:
+            return []
+        out = []
+        for field, direction in sort:
+            col_name = _RIR_TYPED_COLUMNS.get(field, field)
+            try:
+                col = getattr(self.tables.rir, col_name)
+            except AttributeError as exc:
+                raise ValueError(f"Unknown rir sort field {field!r}") from exc
+            out.append(desc(col) if direction == -1 else col)
+        return out
+
+    def count(self, flt):
+        """Return the row count matching ``flt``."""
+        stmt = select(func.count()).select_from(self.tables.rir)
+        if flt is not None:
+            stmt = stmt.where(flt)
+        with self.db.connect() as conn:
+            return conn.execute(stmt).scalar() or 0
+
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
+        """Yield distinct values of ``field`` matching ``flt``.
+
+        ``field`` accepts either a typed column name
+        (``country``, ``netname``, ``aut-num``, ...) or a JSONB
+        path into ``extra`` (the shape ``MongoDBRir.distinct``
+        accepts).  Typed columns map to the SQL column directly;
+        JSONB paths use the ``->>`` operator.
+        """
+        col = self._field_to_sa(field)
+        stmt = select(col).distinct()
+        if flt is not None:
+            stmt = stmt.where(flt)
+        if sort:
+            for s_field, direction in sort:
+                s_col = self._field_to_sa(s_field)
+                stmt = stmt.order_by(desc(s_col) if direction == -1 else s_col)
+        if skip is not None:
+            stmt = stmt.offset(skip)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                yield row[0]
+
+    def _field_to_sa(self, field):
+        """Translate a Mongo-style field path into a SA column /
+        JSONB accessor.
+
+        Typed columns (the keys of :data:`_RIR_TYPED_COLUMNS`,
+        plus ``size`` / ``schema_version``) map to the column
+        directly.  Anything else is treated as a JSONB path into
+        :attr:`Rir.extra` via the ``->>`` operator (textual
+        projection).
+        """
+        if field in _RIR_TYPED_COLUMNS:
+            return getattr(self.tables.rir, _RIR_TYPED_COLUMNS[field])
+        if field in {"size", "schema_version", "id"}:
+            return getattr(self.tables.rir, field)
+        return self.tables.rir.extra.op("->>")(field)
+
+    def topvalues(
+        self,
+        field,
+        flt=None,
+        topnbr=10,
+        sort=None,
+        limit=None,
+        skip=None,
+        least=False,
+    ):
+        """Yield ``(value, count)`` pairs of the most common
+        values of ``field`` matching ``flt``.
+
+        Mirrors :meth:`MongoDBRir.topvalues` -- ``least=True``
+        flips the order to least-common-first, ``topnbr`` caps
+        the number of buckets, ``flt`` narrows the population.
+        """
+        del sort, limit, skip  # absorbed into the aggregation below
+        col = self._field_to_sa(field)
+        cnt = func.count().label("count")
+        stmt = select(col.label("value"), cnt)
+        if flt is not None:
+            stmt = stmt.where(flt)
+        stmt = stmt.group_by(col)
+        stmt = stmt.order_by(cnt.asc() if least else cnt.desc())
+        if topnbr:
+            stmt = stmt.limit(int(topnbr))
+        with self.db.connect() as conn:
+            for row in conn.execute(stmt):
+                yield {"_id": row.value, "count": row.count}
+
+    # -- Ingestion path ----------------------------------------------
+    #
+    # The shared :meth:`DBRir.import_files` parser drives one
+    # ``insert_bulk(bulk, rec)`` call per parsed whois block; the
+    # SQL backend accumulates bound rows in the bulk and flushes
+    # via ``executemany`` either when the batch fills up or at
+    # ``stop_bulk`` time.  Mirrors
+    # :meth:`MongoDBRir.start_bulk` / ``insert_bulk`` /
+    # ``stop_bulk``.
+
+    @staticmethod
+    def start_bulk():
+        """Allocate a fresh in-memory bulk-insert buffer."""
+        return []
+
+    def insert_bulk(self, bulk, rec):
+        """Append a parsed whois record to the bulk buffer.
+
+        Flushes the bulk to the database (and resets it to an
+        empty list) once it reaches
+        :data:`config.POSTGRES_BATCH_SIZE`, matching the
+        chunk-flush rhythm :meth:`MongoDBRir.insert_bulk` uses
+        for ``MONGODB_BATCH_SIZE``.
+        """
+        bulk.append(self._record_to_row(rec))
+        if len(bulk) >= config.POSTGRES_BATCH_SIZE:
+            self._flush_bulk(bulk)
+            return []
+        return bulk
+
+    def stop_bulk(self, bulk):
+        """Flush any remaining buffered rows."""
+        if bulk:
+            self._flush_bulk(bulk)
+
+    def _flush_bulk(self, bulk):
+        """Issue an ``executemany`` ``INSERT`` for ``bulk``.
+
+        SQLAlchemy's :func:`insert` plus a list-of-dicts
+        executemany is enough on the SQL side -- RIR rows are
+        bulk-only loaded (no per-record updates), so no ON
+        CONFLICT path is needed.
+        """
+        if not bulk:
+            return
+        utils.LOGGER.debug("DB:SQL bulk RIR insert: %d", len(bulk))
+        with self.db.begin() as conn:
+            conn.execute(insert(self.tables.rir), bulk)
+
+    @classmethod
+    def _record_to_row(cls, rec):
+        """Translate a parsed whois record dict (the shape
+        :meth:`DBRir.import_files` passes to ``insert_bulk``)
+        into a SQL row dict for :class:`Rir`.
+
+        The typed columns (:data:`_RIR_TYPED_COLUMNS`) are
+        projected directly; ``size`` is computed for
+        inet[6]num records via :func:`_compute_rir_size_sql`
+        (mirrors :meth:`MongoDBRir._compute_rir_size`); every
+        other key lands in :attr:`Rir.extra` for forward
+        compatibility.
+        """
+        row = {col_name: None for col_name in _RIR_TYPED_COLUMNS_INVERSE}
+        extra = {}
+        for key, value in rec.items():
+            col_name = _RIR_TYPED_COLUMNS.get(key)
+            if col_name is None:
+                extra[key] = value
+                continue
+            row[col_name] = value
+        # ``aut-num`` records carry the integer in ``aut_num``
+        # already (the parser coerces it via ``int(...)`` in
+        # :meth:`DBRir.import_files`).  Pin the type so
+        # SQLAlchemy doesn't bind it as a string.
+        if row["aut_num"] is not None and not isinstance(row["aut_num"], int):
+            row["aut_num"] = int(row["aut_num"])
+        row["size"] = _compute_rir_size_sql(row.get("start"), row.get("stop"))
+        row["extra"] = extra or None
+        row["schema_version"] = cls.SCHEMA_VERSION
+        return row
+
+
+def _coerce_asnum_sql(asnum):
+    """Coerce an AS-number argument to ``int``.
+
+    Mirrors :func:`ivre.db.mongo._coerce_asnum`'s scalar shape
+    (the SA-side ``_search_field`` already handles regex / list
+    dispatch around it).  Strings starting with ``"AS"`` /
+    ``"as"`` strip the prefix; bare strings parse as ``int``.
+    """
+    if isinstance(asnum, int):
+        return asnum
+    s = str(asnum).strip()
+    if s[:2].upper() == "AS":
+        s = s[2:]
+    return int(s)
+
+
+def _compute_rir_size_sql(start, stop):
+    """Return the inclusive address-count of a ``(start, stop)``
+    IP range as a Python ``int`` (cast to ``Decimal`` by the SA
+    layer thanks to the ``Numeric(40, 0)`` column type).
+
+    Mirrors :meth:`MongoDBRir._compute_rir_size` -- the value is
+    pinned at insert time so the web ``/rir`` route can sort
+    narrowest-first without an aggregation pipeline.  Returns
+    ``None`` for ``aut-num`` records (no range).
+    """
+    if start is None or stop is None:
+        return None
+    try:
+        start_int = int(utils.ip2int(start))
+        stop_int = int(utils.ip2int(stop))
+    except (ValueError, OSError):
+        return None
+    return stop_int - start_int + 1
+
+
+# ---------------------------------------------------------------------
+# SQLDBAuth -- shared base for the SQL backends' authentication
+# data category.  Mirrors :class:`MongoDBAuth`
+# (``ivre/db/mongo.py:7333``) byte-for-byte at the dict-output
+# level so the web layer's auth code paths (login / session /
+# API key / magic link / rate limit) work unchanged on either
+# backend.
+#
+# Mongo's TTL indexes on session / magic-link / rate-limit
+# collections expire rows server-side; PostgreSQL and DuckDB
+# have no equivalent, so every read filter that needs the TTL
+# semantics adds an explicit ``WHERE expires_at > now()`` /
+# ``WHERE created_at > cutoff`` predicate.  Expired rows
+# accumulate without harm until an operator-driven cleanup
+# runs (a future ``ivre authcli --vacuum`` will automate it).
+# ---------------------------------------------------------------------
+
+
+def _now_utc():
+    """Return the current UTC timestamp as a timezone-aware
+    :class:`datetime`.
+
+    Centralised so the helper paths emit one shape (matches
+    :meth:`MongoDBAuth`'s ``datetime.now(tz=utc)`` calls).
+    """
+    return datetime.datetime.now(tz=datetime.timezone.utc)
+
+
+def _sha256_hex(value):
+    """SHA-256 hex digest of ``value``.
+
+    Mirrors :meth:`MongoDBAuth`'s ``hashlib.sha256(token.encode
+    ()).hexdigest()`` shape so the on-disk hash matches
+    byte-for-byte across backends -- an API key created on
+    MongoDB validates against an SQL backend pointing at the
+    same hash table contents.
+    """
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+class SQLDBAuth(SQLDB, DBAuth):
+    """SQL-backend base for the authentication data category.
+
+    Concrete dialects (PostgreSQL, DuckDB, ...) inherit this
+    together with their ``SQLDB`` flavour; no per-dialect
+    override is needed for the current method set because every
+    statement uses portable SQL (no ``ON CONFLICT`` expression
+    inference, no GIN-specific aggregation).
+    """
+
+    table_layout = namedtuple(
+        "auth_layout",
+        ["user", "session", "api_key", "rate_limit", "magic_link"],
+    )
+    tables = table_layout(
+        AuthUser, AuthSession, AuthApiKey, AuthRateLimit, AuthMagicLink
+    )
+
+    # Bound to a free-standing constant so a future schema bump
+    # (new column, new index) can advance the marker without
+    # touching :class:`MongoDBAuth`.  Starts at 1: the SQL
+    # backend has no records pre-dating this PR, so no
+    # historical migration is required at this point.
+    SCHEMA_VERSION = 1
+
+    @staticmethod
+    def _row2user(row):
+        """Project an :class:`AuthUser` row into the dict shape
+        :class:`MongoDBAuth` returns (``email`` / ``display_name``
+        / ``is_admin`` / ``is_active`` / ``groups`` /
+        ``created_at`` / ``last_login`` plus the synthetic
+        ``_id`` Mongo callers expect).
+        """
+        if row is None:
+            return None
+        return {
+            "_id": row.id,
+            "email": row.email,
+            "display_name": row.display_name,
+            "is_admin": bool(row.is_admin) if row.is_admin is not None else False,
+            "is_active": bool(row.is_active) if row.is_active is not None else False,
+            "groups": list(row.groups) if row.groups else [],
+            "created_at": row.created_at,
+            "last_login": row.last_login,
+        }
+
+    @staticmethod
+    def _row2apikey(row):
+        """Project an :class:`AuthApiKey` row into the dict
+        shape :meth:`MongoDBAuth.list_api_keys` returns.
+        """
+        return {
+            "_id": row.id,
+            "key_hash": row.key_hash,
+            "key_prefix": row.key_prefix,
+            "user_email": row.user_email,
+            "name": row.name,
+            "created_at": row.created_at,
+            "expires_at": row.expires_at,
+            "last_used": row.last_used,
+        }
+
+    # -- user CRUD ----------------------------------------------------
+
+    def get_user_by_email(self, email):
+        """Return the user record matching ``email`` (case-
+        sensitive, mirrors :meth:`MongoDBAuth`), or ``None``.
+        """
+        with self.db.connect() as conn:
+            row = conn.execute(
+                select(self.tables.user).where(self.tables.user.email == email)
+            ).first()
+        return self._row2user(row)
+
+    def create_user(
+        self, email, display_name=None, is_admin=False, is_active=False, groups=None
+    ):
+        """Insert a new user row.
+
+        Mirrors :meth:`MongoDBAuth.create_user`'s return shape
+        (the post-insert document dict).  The shared
+        :meth:`DBAuth` callers expect this dict directly back
+        from ``create_user``.
+        """
+        doc = {
+            "email": email,
+            "display_name": display_name or email,
+            "is_admin": is_admin,
+            "is_active": is_active,
+            "groups": list(groups) if groups else [],
+            "created_at": _now_utc(),
+            "last_login": None,
+            "schema_version": self.SCHEMA_VERSION,
+        }
+        with self.db.begin() as conn:
+            conn.execute(insert(self.tables.user).values(doc))
+        # Return the dict shape Mongo produces; the inserted
+        # row would otherwise need a SELECT round-trip just to
+        # pick up the ``id`` -- which the auth callers don't
+        # consult on the create path.
+        return {k: v for k, v in doc.items() if k != "schema_version"}
+
+    def update_user(self, email, **updates):
+        """Apply partial-update fields to the user row.
+
+        Mirrors :meth:`MongoDBAuth.update_user`'s ``$set``
+        semantics: only the keys present in ``updates`` are
+        rewritten; everything else is left untouched.
+        """
+        if not updates:
+            return
+        with self.db.begin() as conn:
+            conn.execute(
+                update(self.tables.user)
+                .where(self.tables.user.email == email)
+                .values(**updates)
+            )
+
+    def delete_user(self, email):
+        """Delete a user row and every dependent record.
+
+        Cascade in application code (mirrors
+        :meth:`MongoDBAuth.delete_user`): sessions and api-keys
+        reference the user by email, and magic-link records
+        carry the email directly.  Drop all of them in one
+        transaction so a partial failure leaves no dangling
+        sessions / api-keys.
+        """
+        with self.db.begin() as conn:
+            conn.execute(
+                delete(self.tables.session).where(
+                    self.tables.session.user_email == email
+                )
+            )
+            conn.execute(
+                delete(self.tables.api_key).where(
+                    self.tables.api_key.user_email == email
+                )
+            )
+            conn.execute(
+                delete(self.tables.magic_link).where(
+                    self.tables.magic_link.email == email
+                )
+            )
+            conn.execute(
+                delete(self.tables.user).where(self.tables.user.email == email)
+            )
+
+    def add_user_group(self, email, group):
+        """Add ``group`` to the user's group list (idempotent).
+
+        Mirrors :meth:`MongoDBAuth.add_user_group`'s
+        ``$addToSet`` semantics: a no-op if the group is
+        already present.  PostgreSQL accepts the array literal
+        as a bind value; DuckDB's ``LIST`` type understands
+        the same syntax.
+        """
+        # The PG-native ``array_append`` adds duplicates;
+        # emulate ``$addToSet`` by reading-then-writing in one
+        # transaction so two concurrent sessions never end up
+        # with the same group twice.  Single-writer DuckDB
+        # makes the race window benign; on PG the serial
+        # transaction isolation handles it.
+        with self.db.begin() as conn:
+            row = conn.execute(
+                select(self.tables.user.groups).where(self.tables.user.email == email)
+            ).first()
+            if row is None:
+                return
+            current = list(row.groups or [])
+            if group in current:
+                return
+            current.append(group)
+            conn.execute(
+                update(self.tables.user)
+                .where(self.tables.user.email == email)
+                .values(groups=current)
+            )
+
+    def remove_user_group(self, email, group):
+        """Drop ``group`` from the user's group list.
+
+        Mirrors :meth:`MongoDBAuth.remove_user_group`'s
+        ``$pull`` semantics: a no-op if the group is not
+        present.
+        """
+        with self.db.begin() as conn:
+            row = conn.execute(
+                select(self.tables.user.groups).where(self.tables.user.email == email)
+            ).first()
+            if row is None:
+                return
+            current = list(row.groups or [])
+            if group not in current:
+                return
+            current.remove(group)
+            conn.execute(
+                update(self.tables.user)
+                .where(self.tables.user.email == email)
+                .values(groups=current)
+            )
+
+    def get_user_groups(self, email):
+        """Return the user's group list (empty if no user).
+
+        Mirrors :meth:`MongoDBAuth.get_user_groups`.
+        """
+        with self.db.connect() as conn:
+            row = conn.execute(
+                select(self.tables.user.groups).where(self.tables.user.email == email)
+            ).first()
+        if row is None or row.groups is None:
+            return []
+        return list(row.groups)
+
+    def list_users(self, **filters):
+        """Yield user records matching the optional filters.
+
+        Mirrors :meth:`MongoDBAuth.list_users`'s recognised
+        filters: ``is_active`` / ``is_admin`` / ``group``
+        (group membership).  Unknown filters are silently
+        ignored (matches Mongo's accept-any-dict shape).
+        """
+        stmt = select(self.tables.user)
+        if "is_active" in filters:
+            stmt = stmt.where(self.tables.user.is_active == filters["is_active"])
+        if "is_admin" in filters:
+            stmt = stmt.where(self.tables.user.is_admin == filters["is_admin"])
+        if "group" in filters:
+            # PG / DuckDB array contains: ``ANY(col)`` style.
+            stmt = stmt.where(self.tables.user.groups.any(filters["group"]))
+        with self.db.connect() as conn:
+            return [self._row2user(row) for row in conn.execute(stmt)]
+
+    def ensure_remote_user(self, username):
+        """Create the user if it doesn't exist, then return it.
+
+        Mirrors :meth:`MongoDBAuth.ensure_remote_user`: used by
+        the OAuth callback path to provision users on first
+        login.
+        """
+        user = self.get_user_by_email(username)
+        if user is None:
+            self.create_user(username, is_active=True)
+        return self.get_user_by_email(username)
+
+    # -- session CRUD -------------------------------------------------
+
+    def create_session(self, user_email, lifetime=None):
+        """Create a session for ``user_email`` and return the
+        opaque token to set in the client cookie.
+
+        Mirrors :meth:`MongoDBAuth.create_session`: the token
+        is a 32-byte URL-safe random string, the database
+        stores only its SHA-256 hex digest, and
+        ``user.last_login`` is bumped to the current UTC
+        timestamp.
+        """
+        if lifetime is None:
+            lifetime = config.WEB_AUTH_SESSION_LIFETIME
+        token = token_urlsafe(32)
+        token_hash = _sha256_hex(token)
+        now = _now_utc()
+        with self.db.begin() as conn:
+            conn.execute(
+                insert(self.tables.session).values(
+                    token_hash=token_hash,
+                    user_email=user_email,
+                    created_at=now,
+                    expires_at=now + datetime.timedelta(seconds=lifetime),
+                    last_used=now,
+                )
+            )
+            conn.execute(
+                update(self.tables.user)
+                .where(self.tables.user.email == user_email)
+                .values(last_login=now)
+            )
+        return token
+
+    def validate_session(self, token):
+        """Return the associated user dict if the session is
+        valid, ``None`` otherwise.
+
+        Mirrors :meth:`MongoDBAuth.validate_session`: looks up
+        the row by ``token_hash``, rejects if
+        ``expires_at <= now()``, bumps ``last_used`` on success.
+        Expired sessions are not deleted here (matches Mongo's
+        TTL-driven behaviour where the index expires them
+        out-of-band); the operator-driven vacuum is a follow-up.
+        """
+        token_hash = _sha256_hex(token)
+        now = _now_utc()
+        with self.db.begin() as conn:
+            row = conn.execute(
+                select(self.tables.session.id, self.tables.session.user_email).where(
+                    and_(
+                        self.tables.session.token_hash == token_hash,
+                        self.tables.session.expires_at > now,
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+            conn.execute(
+                update(self.tables.session)
+                .where(self.tables.session.id == row.id)
+                .values(last_used=now)
+            )
+            user_email = row.user_email
+        return self.get_user_by_email(user_email)
+
+    def delete_session(self, token):
+        """Drop the session row identified by ``token``.
+
+        Mirrors :meth:`MongoDBAuth.delete_session`.
+        """
+        token_hash = _sha256_hex(token)
+        with self.db.begin() as conn:
+            conn.execute(
+                delete(self.tables.session).where(
+                    self.tables.session.token_hash == token_hash
+                )
+            )
+
+    # -- API-key CRUD -------------------------------------------------
+
+    def create_api_key(self, user_email, name):
+        """Create an API key for ``user_email`` and return the
+        raw key (the only time it's visible).
+
+        Mirrors :meth:`MongoDBAuth.create_api_key`: the key is
+        ``ivre_<22-char-base64-url>``, stored as SHA-256 hex
+        digest + a 12-char clear-text prefix surfaced in
+        admin UIs.
+        """
+        key = f"ivre_{token_urlsafe(32)}"
+        key_hash = _sha256_hex(key)
+        now = _now_utc()
+        with self.db.begin() as conn:
+            conn.execute(
+                insert(self.tables.api_key).values(
+                    key_hash=key_hash,
+                    key_prefix=key[:12],
+                    user_email=user_email,
+                    name=name,
+                    created_at=now,
+                    expires_at=None,
+                    last_used=None,
+                )
+            )
+        return key
+
+    def validate_api_key(self, key):
+        """Return the associated user dict if the key is valid,
+        ``None`` otherwise.
+
+        Mirrors :meth:`MongoDBAuth.validate_api_key`: rejects
+        if the key is unknown or if ``expires_at`` is set and
+        ``<= now()``; bumps ``last_used`` on success.
+        """
+        key_hash = _sha256_hex(key)
+        now = _now_utc()
+        with self.db.begin() as conn:
+            row = conn.execute(
+                select(self.tables.api_key.id, self.tables.api_key.user_email).where(
+                    and_(
+                        self.tables.api_key.key_hash == key_hash,
+                        or_(
+                            self.tables.api_key.expires_at.is_(None),
+                            self.tables.api_key.expires_at > now,
+                        ),
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+            conn.execute(
+                update(self.tables.api_key)
+                .where(self.tables.api_key.id == row.id)
+                .values(last_used=now)
+            )
+            user_email = row.user_email
+        return self.get_user_by_email(user_email)
+
+    def list_api_keys(self, user_email=None):
+        """Return every API key record (admin path) or the
+        subset owned by ``user_email`` (self-service path).
+
+        Mirrors :meth:`MongoDBAuth.list_api_keys`.
+        """
+        stmt = select(self.tables.api_key)
+        if user_email is not None:
+            stmt = stmt.where(self.tables.api_key.user_email == user_email)
+        with self.db.connect() as conn:
+            return [self._row2apikey(row) for row in conn.execute(stmt)]
+
+    def delete_api_key(self, key_hash, user_email=None):
+        """Delete the API-key row identified by ``key_hash``,
+        optionally scoped to ``user_email`` (the self-service
+        path's permission check).
+
+        Returns the number of rows deleted, mirroring Mongo's
+        ``deleted_count`` return value so the caller can
+        distinguish "deleted" from "not found / not owned".
+
+        ``DELETE ... RETURNING`` and a row count rather than
+        :attr:`CursorResult.rowcount` because the
+        ``duckdb-engine`` dialect reports ``-1`` for every
+        DELETE statement -- a regression that would otherwise
+        make every caller's ``if deleted:`` check spurious on
+        the DuckDB lane.  PostgreSQL accepts the same shape
+        without overhead.
+        """
+        stmt = delete(self.tables.api_key).where(
+            self.tables.api_key.key_hash == key_hash
+        )
+        if user_email is not None:
+            stmt = stmt.where(self.tables.api_key.user_email == user_email)
+        stmt = stmt.returning(self.tables.api_key.id)
+        with self.db.begin() as conn:
+            return len(list(conn.execute(stmt)))
+
+    # -- magic-link tokens --------------------------------------------
+
+    def create_magic_link_token(self, email, lifetime):
+        """Create a single-use magic-link token for ``email``
+        and return the raw token.
+
+        Mirrors :meth:`MongoDBAuth.create_magic_link_token`.
+        """
+        token = token_urlsafe(32)
+        token_hash = _sha256_hex(token)
+        now = _now_utc()
+        with self.db.begin() as conn:
+            conn.execute(
+                insert(self.tables.magic_link).values(
+                    token_hash=token_hash,
+                    email=email,
+                    created_at=now,
+                    expires_at=now + datetime.timedelta(seconds=lifetime),
+                )
+            )
+        return token
+
+    def consume_magic_link_token(self, token):
+        """Validate and consume a magic-link token in one shot.
+
+        Mirrors :meth:`MongoDBAuth.consume_magic_link_token`'s
+        ``find_one_and_delete`` semantics: returns the
+        associated email on success (and deletes the row so
+        the token cannot be replayed), ``None`` if invalid /
+        expired.  PostgreSQL and DuckDB both support
+        ``DELETE ... RETURNING`` so the atomic exchange
+        survives without an explicit transaction.
+        """
+        token_hash = _sha256_hex(token)
+        now = _now_utc()
+        stmt = (
+            delete(self.tables.magic_link)
+            .where(
+                and_(
+                    self.tables.magic_link.token_hash == token_hash,
+                    self.tables.magic_link.expires_at > now,
+                )
+            )
+            .returning(self.tables.magic_link.email)
+        )
+        with self.db.begin() as conn:
+            row = conn.execute(stmt).first()
+        if row is None:
+            return None
+        return row.email
+
+    # -- rate limiting ------------------------------------------------
+
+    def is_rate_limited(self, key, max_attempts, window):
+        """Return ``True`` if ``key`` has reached
+        ``max_attempts`` attempts in the trailing ``window``
+        seconds.
+
+        Mirrors :meth:`MongoDBAuth.is_rate_limited`: counts
+        rate-limit rows whose ``created_at`` falls inside the
+        window and compares to the threshold.
+        """
+        now = _now_utc()
+        cutoff = now - datetime.timedelta(seconds=window)
+        stmt = (
+            select(func.count())
+            .select_from(self.tables.rate_limit)
+            .where(
+                and_(
+                    self.tables.rate_limit.key == key,
+                    self.tables.rate_limit.created_at > cutoff,
+                )
+            )
+        )
+        with self.db.connect() as conn:
+            count = conn.execute(stmt).scalar() or 0
+        return count >= max_attempts
+
+    def record_rate_limit(self, key):
+        """Append one attempt against the rate-limit ``key``.
+
+        Mirrors :meth:`MongoDBAuth.record_rate_limit`.
+        """
+        with self.db.begin() as conn:
+            conn.execute(
+                insert(self.tables.rate_limit).values(key=key, created_at=_now_utc())
+            )
+
+
+class SQLDBAudit(SQLDB, DBAudit):
+    """SQL-backend base for the ``audit`` purpose.
+
+    Mirrors :class:`MongoDBAudit`.  Stores append-only events in
+    the ``audit_events`` table (see :class:`AuditEvent` for the
+    schema + indexes).  Insert failures wrap
+    :class:`SQLAlchemyError` in :class:`AuditWriteError`, matching
+    the fail-loud contract.
+
+    No dialect-specific subclass is needed yet; the statements
+    are portable SQL.  The ``PostgresDBAudit`` /
+    ``DuckDBAudit`` registrations in :class:`DBAudit.backends`
+    resolve to this same class via the dialect-flavoured
+    ``PostgresDB`` / ``DuckDB`` SQLDB subclasses (the multiple-
+    inheritance pattern used by every other SQL purpose).
+    """
+
+    table_layout = namedtuple("audit_layout", ["events"])
+    tables = table_layout(AuditEvent)
+
+    SCHEMA_VERSION = 1
+
+    # ``ensure_indexes`` is inherited from :class:`SQLDB`; the
+    # base method walks ``self.tables`` and idempotently
+    # creates every table + every declared :class:`Index` in
+    # one shot, including ``audit_events`` and its three
+    # composite indexes.  No audit-specific override needed.
+
+    @staticmethod
+    def _row2event(row):
+        """Project an :class:`AuditEvent` row into the dict
+        shape :class:`MongoDBAudit` returns.
+
+        ``event_id`` is normalised from SQLAlchemy's hex-with-
+        dashes ``str`` form to the dashes-less 32-char hex the
+        ABC contract speaks.  ``actor`` / ``resource`` /
+        ``details`` are reassembled into the nested dicts the
+        Mongo backend stores natively.
+        """
+        if row is None:
+            return None
+        # ``event_id`` may arrive as ``uuid.UUID`` (on dialects
+        # where SQLAlchemy's Uuid type returns native objects
+        # despite ``as_uuid=False``) or as ``str`` (with or
+        # without dashes depending on the dialect).  Normalise
+        # to the dashes-less hex form so callers see the same
+        # shape across backends.
+        raw_event_id = row.event_id
+        if isinstance(raw_event_id, uuid.UUID):
+            event_id = raw_event_id.hex
+        else:
+            event_id = str(raw_event_id).replace("-", "")
+        return {
+            "event_id": event_id,
+            "event_type": row.event_type,
+            "created_at": row.created_at,
+            "actor": {
+                "user_email": row.actor_user_email,
+                "api_key_hash": row.actor_api_key_hash,
+                "remote_addr": row.actor_remote_addr,
+            },
+            "resource": {
+                "route": row.resource_route,
+                "method": row.resource_method,
+            },
+            "details": row.details or {},
+            "outcome": row.outcome,
+        }
+
+    def record(
+        self,
+        event_type,
+        *,
+        actor=None,
+        resource=None,
+        details=None,
+        outcome=None,
+        event_id=None,
+    ):
+        self._validate_event_type(event_type)
+        self._validate_details(details)
+        event_id = self._normalize_event_id(event_id)
+        actor = actor or {}
+        resource = resource or {}
+        values = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "created_at": _now_utc(),
+            "actor_user_email": actor.get("user_email"),
+            "actor_api_key_hash": actor.get("api_key_hash"),
+            "actor_remote_addr": actor.get("remote_addr"),
+            "resource_route": resource.get("route"),
+            "resource_method": resource.get("method"),
+            "details": details or {},
+            "outcome": outcome,
+        }
+        try:
+            with self.db.begin() as conn:
+                conn.execute(insert(self.tables.events).values(**values))
+        except SQLAlchemyError as exc:
+            # ``SQLAlchemyError`` is the SA 2.x umbrella for
+            # every DBAPI driver failure: psycopg2 /
+            # duckdb-engine / etc. raise their own exception
+            # classes, but SA wraps them in
+            # ``sqlalchemy.exc.DBAPIError`` (a SQLAlchemyError
+            # subclass) with the driver-level exception
+            # available via ``.orig``.  Catching the umbrella
+            # keeps the fail-loud contract for any backend
+            # failure while letting genuine programming bugs
+            # (``TypeError``, ``AttributeError``, ...)
+            # propagate unwrapped so they surface as the bugs
+            # they are rather than as opaque
+            # ``AuditWriteError`` instances.
+            raise AuditWriteError(
+                f"failed to record audit event {event_id} ({event_type}): {exc}"
+            ) from exc
+        return event_id
+
+    def _build_query_stmt(
+        self,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+    ):
+        """Shared WHERE-clause builder for :meth:`query` and
+        :meth:`count`.  Returns a list of SQLAlchemy clauses
+        ready for ``and_(*clauses)``.
+        """
+        clauses = []
+        if event_id is not None:
+            clauses.append(
+                self.tables.events.event_id == self._normalize_event_id(event_id)
+            )
+        if event_type is not None:
+            self._validate_event_type(event_type)
+            clauses.append(self.tables.events.event_type == event_type)
+        if user_email is not None:
+            clauses.append(self.tables.events.actor_user_email == user_email)
+        if since is not None:
+            clauses.append(self.tables.events.created_at >= since)
+        if until is not None:
+            clauses.append(self.tables.events.created_at < until)
+        return clauses
+
+    def query(
+        self,
+        *,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+        limit=None,
+        skip=None,
+    ):
+        clauses = self._build_query_stmt(
+            event_id=event_id,
+            event_type=event_type,
+            user_email=user_email,
+            since=since,
+            until=until,
+        )
+        stmt = select(self.tables.events)
+        if clauses:
+            stmt = stmt.where(and_(*clauses))
+        stmt = stmt.order_by(desc(self.tables.events.created_at))
+        if skip is not None and skip > 0:
+            stmt = stmt.offset(skip)
+        if limit is not None and limit > 0:
+            stmt = stmt.limit(limit)
+        with self.db.connect() as conn:
+            return [self._row2event(row) for row in conn.execute(stmt)]
+
+    def count(
+        self,
+        *,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+    ):
+        clauses = self._build_query_stmt(
+            event_id=event_id,
+            event_type=event_type,
+            user_email=user_email,
+            since=since,
+            until=until,
+        )
+        # ``func.count()`` not-callable is a pre-existing
+        # pylint false positive on this codebase's SQLAlchemy
+        # 2.x usage (see ``ivre/db/sql/__init__.py:1355`` etc.);
+        # mirror the existing pattern.
+        stmt = select(func.count()).select_from(self.tables.events)
+        if clauses:
+            stmt = stmt.where(and_(*clauses))
+        with self.db.connect() as conn:
+            return conn.execute(stmt).scalar() or 0
+
+    def purge_older_than(self, cutoff):
+        stmt = delete(self.tables.events).where(self.tables.events.created_at < cutoff)
+        # ``DELETE ... RETURNING`` for an accurate row count
+        # under both PostgreSQL and DuckDB; the duckdb-engine
+        # dialect returns ``rowcount=-1`` for every DELETE
+        # otherwise (same workaround used in
+        # :meth:`SQLDBAuth.delete_api_key`).  Count rows in a
+        # streaming fashion via ``sum(1 for _ in ...)`` rather
+        # than materialising the ``RETURNING`` result into a
+        # list: for a large purge the difference is one O(N)
+        # int allocation we can avoid for free.
+        stmt = stmt.returning(self.tables.events.id)
+        with self.db.begin() as conn:
+            return sum(1 for _ in conn.execute(stmt))
+
+    def get(self, spec, **kargs):
+        # Low-level escape hatch.  The audit log's primary API
+        # is :meth:`query` / :meth:`count`; ``get`` is provided
+        # for consistency with the ABC.  ``spec`` is ignored
+        # (Mongo-native filter shape does not translate to
+        # SQL); SQL callers should use :meth:`query` directly.
+        del spec, kargs
+        raise NotImplementedError(
+            "SQLDBAudit.get is not supported; use query() instead"
+        )
