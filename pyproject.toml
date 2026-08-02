@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ivre"
+dynamic = ["version"]
+description = "Network recon framework"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12, <4"
+authors = [{ name = "Pierre LALET", email = "pierre@droids-corp.org" }]
+keywords = [
+    "network",
+    "network recon",
+    "network cartography",
+    "nmap",
+    "masscan",
+    "zmap",
+    "zgrab",
+    "zdns",
+    "bro",
+    "zeek",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Telecommunications Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Software Distribution",
+]
+dependencies = [
+    "cryptography",
+    "defusedxml",
+    "pymongo>=4.10",
+    # ``X509.to_cryptography`` is used in ``ivre.utils.get_cert_info``
+    # for the SubjectAlternativeName lookup; it landed in
+    # pyOpenSSL 17.1.0 (the legacy ``X509.get_extension`` /
+    # ``get_extension_count`` index loop was removed in 26.x).
+    "pyOpenSSL>=17.1.0",
+    "bottle",
+    # Static ReDoS analyser (Doyensec). Used by
+    # ``ivre.web.utils.validate_regex_complexity`` to reject
+    # user-supplied regex literals that would exhibit catastrophic
+    # backtracking when forwarded to MongoDB's ``$regex``. Pure
+    # Python, no transitive dependencies, Apache-2.0 licensed.
+    "regexploit>=1.0,<2",
+]
+
+[project.optional-dependencies]
+postgres = ["sqlalchemy>=2,<3", "psycopg2"]
+# DuckDB embedded backend. ``duckdb-engine`` is the SQLAlchemy
+# dialect; it inherits from PostgreSQL's psycopg2 dialect, so the
+# ``[postgres]`` extra is *not* required for DuckDB-only setups
+# (``sqlalchemy`` is pulled in transitively via ``duckdb-engine``).
+duckdb = ["duckdb>=1.5,<2", "duckdb-engine>=0.17,<1"]
+elasticsearch = ["elasticsearch", "elasticsearch-dsl"]
+gssapi-mongo = ["gssapi"]
+gssapi-http = ["pycurl"]
+screenshots = ["Pillow"]
+mediawiki = ["mysqlclient"]
+3d-traceroute = ["dbus-python"]
+plots = ["matplotlib"]
+ja3 = ["scapy"]
+mcp = ["mcp"]
+linting = ["bandit", "black", "codespell", "flake8", "mypy", "pylint", "rstcheck[sphinx]", "sphinx-lint"]
+doc = ["Sphinx", "docutils!=0.18", "sphinx_rtd_theme", "sphinxcontrib-httpdomain"]
+
+[project.urls]
+Homepage = "https://ivre.rocks/"
+Repository = "https://github.com/ivre/ivre"
+Download = "https://github.com/ivre/ivre/tarball/master"
+
+[project.scripts]
+ivre = "ivre.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ivre*"]
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+tag_regex = "^v?(?P<version>.+)$"
+fallback_version = "0.0.0"
+version_file = "ivre/_version.py"
+
+[tool.rstcheck]
+ignore_directives = ["autobottle", "graphviz"]
+ignore_messages = '(Link is formatted in Markdown style\.$)'
