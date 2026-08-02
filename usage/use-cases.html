@@ -1,0 +1,319 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Some use cases &mdash; IVRE  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Active recon" href="active-recon.html" />
+    <link rel="prev" title="Usage" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            IVRE
+              <img src="../_static/logo.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview/index.html">Overview</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../install/index.html">Installation</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Usage</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Some use cases</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#your-own-shodan-zoomeye-censys-binaryedgeio-whatever">Your own Shodan / ZoomEye / Censys / Binaryedgeio / whatever</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#your-own-passive-dns-service">Your own Passive DNS service</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#mcp-server-llm-agents">MCP server (LLM agents)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#yeti-plugin">YETI plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#cortex-analyzer">Cortex analyzer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#opencti-connector">OpenCTI connector</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#obsidian-plugin">Obsidian plugin</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#blog-posts-and-other-resources">Blog posts and other resources</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="active-recon.html">Active recon</a></li>
+<li class="toctree-l2"><a class="reference internal" href="passive.html">Passive</a></li>
+<li class="toctree-l2"><a class="reference internal" href="flow.html">Flow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="iprange.html">IP range enumeration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="web-ui.html">Web User Interface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="web-auth.html">Web Authentication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kibana.html">IVRE with Kibana</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mcp-server.html">MCP server</a></li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../dev/index.html">Development</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Licenses:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../license.html">IVRE: GPL v3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../license-external.html">Licenses for external files</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">IVRE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Usage</a></li>
+      <li class="breadcrumb-item active">Some use cases</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/usage/use-cases.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="some-use-cases">
+<h1>Some use cases<a class="headerlink" href="#some-use-cases" title="Link to this heading"></a></h1>
+<p>As a <em>framework</em>, IVRE has several possible use cases. Of course, you
+probably want to use only parts of what IVRE can do.</p>
+<section id="your-own-shodan-zoomeye-censys-binaryedgeio-whatever">
+<h2>Your own Shodan / ZoomEye / Censys / Binaryedgeio / whatever<a class="headerlink" href="#your-own-shodan-zoomeye-censys-binaryedgeio-whatever" title="Link to this heading"></a></h2>
+<p>You can use IVRE as a private (or even public, if you want)
+alternative to Shodan (or any other similar service).</p>
+<p>The main difference with public services is that you will have the
+control of your data. You can scan whatever you want (your private
+networks, public networks, a specific country or Autonomous System,
+the whole Internet, etc.), for any port or protocol. You can run any
+query on your data; no-one has to know what you are really looking
+for.</p>
+<p>Of course, this require more work than just using an existing public
+service, but the benefits are huge!</p>
+<p>IVRE does not come with a scanner, and takes advantage of <a class="reference external" href="https://nmap.org/">Nmap</a>, <a class="reference external" href="https://github.com/robertdavidgraham/masscan">Masscan</a> and <a class="reference external" href="https://zmap.io/">Zgrab / Zgrab2</a>. Depending on your use case, you can choose one
+or use both (IVRE will happily merge the results for you). Remember to
+use the <code class="docutils literal notranslate"><span class="pre">-oX</span></code> option (which works with both Nmap and Masscan) or
+<code class="docutils literal notranslate"><span class="pre">-o</span></code> for Zgrab2, as IVRE needs the XML output file for Nmap and
+Masscan, and JSON for Zgrab2.</p>
+<p>You will then store the results from the XML or JSON output files into
+IVRE database using <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">scan2db</span></code>.</p>
+<p>Finally, use <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">db2view</span> <span class="pre">nmap</span></code> to create a <code class="docutils literal notranslate"><span class="pre">view</span></code> (see
+<a class="reference internal" href="../overview/principles.html#purposes"><span class="std std-ref">Purposes</span></a>) that you can explore with the
+<a class="reference internal" href="web-ui.html#web-user-interface"><span class="std std-ref">Web User Interface</span></a>.</p>
+<p>See <a class="reference internal" href="kibana.html#ivre-with-kibana"><span class="std std-ref">IVRE with Kibana</span></a> if you want to use Kibana to
+explore your scan results.</p>
+</section>
+<section id="your-own-passive-dns-service">
+<h2>Your own Passive DNS service<a class="headerlink" href="#your-own-passive-dns-service" title="Link to this heading"></a></h2>
+<p>Passive DNS services log DNS answers into a database and let you run
+queries against them.</p>
+<p>IVRE uses its <a class="reference external" href="https://www.zeek.org/">Zeek</a> script <code class="docutils literal notranslate"><span class="pre">passiverecon</span></code>
+to, among others, log DNS answers. They are stored in the <code class="docutils literal notranslate"><span class="pre">passive</span></code>
+purpose (see <a class="reference internal" href="../overview/principles.html#purposes"><span class="std std-ref">Purposes</span></a>) via <code class="docutils literal notranslate"><span class="pre">ivre</span>
+<span class="pre">passiverecon2db</span></code> CLI tool as <code class="docutils literal notranslate"><span class="pre">DNS_ANSWER</span></code> records.</p>
+<p>They can be queried using <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">iphost</span></code> CLI tool, as in the
+following example (the results come from a PCAP file used in IVRE’s
+<a class="reference internal" href="../dev/tests.html#tests"><span class="std std-ref">Tests</span></a>):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ ivre iphost ipv4.icanhazip.com
+ipv4.icanhazip.com A 216.69.252.101 (109.0.66.10:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+ipv4.icanhazip.com A 216.69.252.100 (109.0.66.10:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+ipv4.icanhazip.com A 216.69.252.100 (109.0.66.20:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+ipv4.icanhazip.com A 216.69.252.101 (109.0.66.20:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+
+$ ivre iphost 216.69.252.101
+ipv4.icanhazip.com A 216.69.252.101 (109.0.66.10:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+ipv4.icanhazip.com A 216.69.252.101 (109.0.66.20:53, 1 time, 2014-01-02 09:37:57.197000 - 2014-01-02 09:37:57.197000)
+</pre></div>
+</div>
+<p>To see an interactive session of IVRE using passive data (including
+DNS answers), have a look at <a class="reference internal" href="../overview/screenshots.html#passive-network-analysis"><span class="std std-ref">Passive network analysis</span></a>.</p>
+</section>
+<section id="mcp-server-llm-agents">
+<h2>MCP server (LLM agents)<a class="headerlink" href="#mcp-server-llm-agents" title="Link to this heading"></a></h2>
+<p>IVRE ships an <a class="reference external" href="https://modelcontextprotocol.io/">MCP</a> (Model Context
+Protocol) server that exposes the database to LLM agents (Claude Code,
+Claude Desktop, Cursor, OpenCode, VS Code with GitHub Copilot,
+Windsurf, JetBrains AI Assistant, …). Once configured, the agent
+can answer natural-language questions over the same data the Web UI
+serves – “How many hosts are running SSH?”, “Show me the top
+products on port 443 in Germany.”, “List hosts affected by
+CVE-2021-44228.” – by calling the typed tools the server exposes
+(filter builders, <code class="docutils literal notranslate"><span class="pre">count</span></code>, <code class="docutils literal notranslate"><span class="pre">get</span></code>, <code class="docutils literal notranslate"><span class="pre">topvalues</span></code>, <code class="docutils literal notranslate"><span class="pre">distinct</span></code>,
+etc.).</p>
+<p>Both transports supported by the MCP specification are available:
+<code class="docutils literal notranslate"><span class="pre">stdio</span></code> (the agent spawns <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">mcp-server</span></code> locally) and
+<em>Streamable HTTP</em> (a shared <code class="docutils literal notranslate"><span class="pre">ivre</span> <span class="pre">mcp-server</span> <span class="pre">--http</span></code> exposed behind
+nginx, authenticated with the same API keys as the Web UI). The
+Docker reference deployment ships a dedicated <code class="docutils literal notranslate"><span class="pre">ivre/web-mcp</span></code>
+container reverse-proxied at <code class="docutils literal notranslate"><span class="pre">/mcp</span></code> by <code class="docutils literal notranslate"><span class="pre">ivre/web</span></code>.</p>
+<p>For installation, transport options, authentication and per-client
+configuration snippets, see <a class="reference internal" href="mcp-server.html"><span class="doc">MCP server</span></a>.</p>
+<p><img alt="ivre_mcp_topssh_1" src="../_images/ivre-mcp-topssh-1.png" /></p>
+<p><img alt="ivre_mcp_topssh_2" src="../_images/ivre-mcp-topssh-2.png" /></p>
+</section>
+<section id="yeti-plugin">
+<h2>YETI plugin<a class="headerlink" href="#yeti-plugin" title="Link to this heading"></a></h2>
+<p><a class="reference external" href="https://yeti-platform.github.io/">Yeti</a> is a platform meant to
+organize observables, indicators of compromise, TTPs, and knowledge on
+threats in a single, unified repository.</p>
+<p>It comes with an “analytics” plugin that uses IVRE’s data to create
+links between IP addresses, hostnames, certificates, etc.</p>
+<p>To learn more about this plugin, have a look at <a class="reference external" href="https://github.com/yeti-platform/yeti/tree/master/contrib/analytics/ivre_api">its documentation</a>.</p>
+<p><img alt="yeti_investigation" src="../_images/yeti_investigation.png" /></p>
+</section>
+<section id="cortex-analyzer">
+<h2>Cortex analyzer<a class="headerlink" href="#cortex-analyzer" title="Link to this heading"></a></h2>
+<p><a class="reference external" href="https://thehive-project.org/">Cortex</a> is a tool to analyze
+observables for SOCs, CSIRTs and security researchers; it integrates
+well with TheHive.</p>
+<p>It comes with an “Analyzer” that uses IVRE’s data to report
+intelligence about Autonomous Systems, certificates, domain and host
+names, IP addresses, networks, open ports, etc.</p>
+<p>To learn more about this analyzer, have a look at <a class="reference external" href="https://github.com/TheHive-Project/Cortex-Analyzers/blob/develop/analyzers/IVRE/README.md">its documentation</a>.</p>
+<p><img alt="cortex_analyzer_template" src="../_images/cortex-analyzer-template.png" /></p>
+</section>
+<section id="opencti-connector">
+<h2>OpenCTI connector<a class="headerlink" href="#opencti-connector" title="Link to this heading"></a></h2>
+<p><a class="reference external" href="https://www.opencti.io/">OpenCTI</a> is an open-source cyber threat
+intelligence (CTI) platform.</p>
+<p>It comes with an “internal enrichment connector” that uses IVRE’s data
+to create links between IP addresses, MAC addresses, hostnames,
+certificates, AS numbers and locations.</p>
+<p>To learn more about this connector, have a look at <a class="reference external" href="https://github.com/OpenCTI-Platform/connectors/blob/master/internal-enrichment/ivre/README.md">its documentation</a>.</p>
+<p><img alt="opencti_connector_scans" src="../_images/opencti-connector-scans.png" /></p>
+<p><img alt="opencti_connector_passive" src="../_images/opencti-connector-passive.png" /></p>
+</section>
+<section id="obsidian-plugin">
+<h2>Obsidian plugin<a class="headerlink" href="#obsidian-plugin" title="Link to this heading"></a></h2>
+<p><a class="reference external" href="https://obsidian.md/">Obsidian</a> is a knowledge base and note-taking
+application that relies on Markdown files.</p>
+<p>A <a class="reference external" href="https://github.com/ivre/obsidian-ivre-plugin">community plugin</a>
+exists that uses IVRE’s data to create notes based on IVRE’s data that
+provides context to your notes related to pentest or red team
+engagements, bug bounty hunting, cyber threat intelligence, etc.</p>
+<p>See the <a class="reference external" href="https://github.com/ivre/obsidian-ivre-plugin/blob/master/README.md">plugin’s README</a>.</p>
+<p><img alt="obsidian_graph" src="../_images/obsidian_graph_thunderbird.png" /></p>
+<p><img alt="obsidian_domain" src="../_images/obsidian_domain_1password.png" /></p>
+<p><img alt="obsidian_host" src="../_images/obsidian_address_1password.png" /></p>
+</section>
+<section id="blog-posts-and-other-resources">
+<h2>Blog posts and other resources<a class="headerlink" href="#blog-posts-and-other-resources" title="Link to this heading"></a></h2>
+<p>The author’s blog has some <a class="reference external" href="http://pierre.droids-corp.org/blog/html/tags/ivre.html">IVRE-related blog posts</a> that might be useful.</p>
+<p>Here is a list of other blog posts about or around IVRE:</p>
+<ul>
+<li><p>External attack surface monitoring:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://kaonbytes.com/p/perimeter-scanner/">Building an Automated Perimeter Scanning System with Open Source
+Tools - NMAP, IVRE and Netbox</a></p></li>
+<li><p><a class="reference external" href="https://blog.cybsec.xyz/re-discover-your-company-network-with-ivre/">Re-discover your company network with Ivre</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>Scan the hosts that hit your honeypots, and exploit the results!</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://isc.sans.edu/forums/diary/Whos+Attacking+Me/21933/">Who’s Attacking Me?</a></p></li>
+<li><p><a class="reference external" href="https://www.serializing.me/2019/01/27/three-honeypots-and-a-month-after/">Three Honeypots and a Month After</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>Scanning SAP Services:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://github.com/gelim/nmap-erpscan">gelim/nmap-erpscan</a> on
+Github</p></li>
+<li><p><a class="reference external" href="https://erpscan.io/press-center/blog/sap-services-detection-via-nmap-probes/">SAP Services detection via nmap probes</a></p></li>
+<li><p><a class="reference external" href="https://erpscan.io/press-center/blog/sap-dispatcher-security/">SAP Dispatcher Security</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>IVRE tests &amp; reviews:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://security-bits.de/posts/2018/12/07/ivre.html">IVRE</a></p></li>
+<li><p><a class="reference external" href="https://mstajbakhsh.ir/ivre-drunk-frenchman-port-scanner-framework/">IVRE! Drunk Frenchman Port Scanner Framework!</a></p></li>
+<li><p><a class="reference external" href="https://bestestredteam.com/2019/02/10/visualizing-scans-part-1-ivre/">Visualizing Scans Part 1: IVRE</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+<li><p>Spanish:</p>
+<blockquote>
+<div><ul class="simple">
+<li><p><a class="reference external" href="https://www.welivesecurity.com/la-es/2015/08/11/reconocimiento-de-redes-con-ivre/">Reconocimiento de redes con IVRE</a></p></li>
+</ul>
+</div></blockquote>
+</li>
+</ul>
+<p>You have found (or written) a document that might help other use IVRE
+or decide if they need it? Please let us know: <a class="reference external" href="https://github.com/ivre/ivre/issues/new">open an issue</a> or <a class="reference internal" href="../index.html#contact"><span class="std std-ref">Contact</span></a> us
+so that we can add a link here!</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="index.html" class="btn btn-neutral float-left" title="Usage" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="active-recon.html" class="btn btn-neutral float-right" title="Active recon" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2011 - 2026, Pierre LALET.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
