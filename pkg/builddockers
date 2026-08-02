@@ -1,0 +1,63 @@
+#! /bin/bash
+
+# This file is part of IVRE.
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
+#
+# IVRE is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IVRE is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
+docker pull debian:trixie-slim
+
+VERSION="$(python setup.py --version 2>/dev/null)"
+
+case "$VERSION" in
+    *.dev*)
+	branch="$(git rev-parse --abbrev-ref HEAD)"
+	case "$branch" in
+	    master)
+		tag="latest"
+		;;
+	    HEAD)
+		tag="commit-$(git rev-parse HEAD | cut -c -8)"
+		echo "WARNING: version $VERSION / HEAD" >&2
+		;;
+	    *)
+		tag="branch-$branch"
+		;;
+	esac
+	;;
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+	tag="commit-$VERSION"
+	echo "WARNING: version $VERSION" >&2
+	;;
+    *.*.*)
+	tag="v$VERSION"
+	;;
+esac
+
+git archive --format=tar --prefix=ivre/ HEAD -o docker/base-local/ivre.tar
+tar --owner=root:0 --group=root:0 --transform='s#^#ivre/#' -rf docker/base-local/ivre.tar ivre/_version.py
+
+cd "$(dirname "$0")/../docker" || exit 255
+
+docker build --no-cache -t "ivre/base:$tag" "base-local" || exit $?
+
+for img in client web web-doku web-mcp web-uwsgi ; do
+    docker build --no-cache --build-arg TAG="$tag" -t "ivre/$img:$tag" "$img" || exit $?
+done
+
+# Uncomment to push images
+# docker login
+# for img in base client web web-doku web-mcp web-uwsgi ; do
+#     docker push "ivre/$img:$tag"
+# done

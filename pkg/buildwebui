@@ -1,0 +1,61 @@
+#! /bin/sh
+
+# This file is part of IVRE.
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
+#
+# IVRE is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IVRE is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
+# Build the web-ui workspace and copy the resulting bundle to
+# web/static/ui/. The bundle is fully self-contained (no external HTTP
+# requests at runtime) and is shipped via setup.py as data_files.
+#
+# Run this whenever web-ui/ source files change. The web/static/ui/
+# tree is generated and must not be edited by hand.
+
+set -e
+
+cd "$(dirname "$0")/../web-ui" || exit 255
+
+if ! command -v pnpm >/dev/null 2>&1; then
+    echo "pkg/buildwebui requires pnpm." >&2
+    exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "pkg/buildwebui requires node." >&2
+    exit 1
+fi
+
+# Pin the build to a single Node major version so the shipped
+# bundle under web/static/ui/ is reproducible across developer
+# machines and across the regen CI job that gates the
+# committed tree. The canonical version is also declared in
+# web-ui/.nvmrc and web-ui/package.json's "engines" field --
+# this check is the enforcement layer.
+EXPECTED_NODE_MAJOR=$(tr -d '[:space:]' < .nvmrc)
+ACTUAL_NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
+if [ "$ACTUAL_NODE_MAJOR" != "$EXPECTED_NODE_MAJOR" ]; then
+    echo "pkg/buildwebui requires Node ${EXPECTED_NODE_MAJOR}.x (got $(node --version))." >&2
+    echo "Switch with 'pnpm env use --global ${EXPECTED_NODE_MAJOR}' or 'nvm use'." >&2
+    exit 1
+fi
+
+pnpm install --frozen-lockfile
+pnpm build
+
+rm -rf ../web/static/ui
+mv dist ../web/static/ui
+
+# Reuse the legacy favicon so we keep a single source of truth.
+cp ../web/static/favicon.png ../web/static/ui/favicon.png
