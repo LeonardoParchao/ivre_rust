@@ -1,0 +1,4 @@
+LIBRARY
+EXPORTS
+  __rustc_proc_macro_decls_390fef4b2b1fc8de__ DATA
+  rust_metadata_zerovec_derive_390fef4b2b1fc8de DATA
